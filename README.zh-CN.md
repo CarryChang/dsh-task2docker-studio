@@ -23,6 +23,19 @@
 
 外加内置技能（`task2docker-studio`），教授安全闭环：whoami → catalog → 确认 → dispatch → 轮询 → exec → stop，含容器路径（`/output`、`/input*`）与保密规则。
 
+## 核心工作流
+
+固定闭环，宿主机始终只当控制端：
+
+1. **t2d_whoami** —— 会话开头读一次账户画像：身份、余额、欠款、配额分钟数、在跑任务数。锁定或有欠款，先告知用户再谈下发。
+2. **t2d_catalog** —— 列出集群可用镜像（runtime）与算力档位（resource）。runtime/resource 只能取自这里，带 `affordable` / `isFullLoad` 闸门，任一不过即当前不可用。
+3. **t2d_dispatch** —— 下发任务：`TASK` 把命令编进 job 跑完即退；`WORKSPACE` 起交互式容器。**先复述配置与计费后果、拿到用户同意**，再带 `confirm:true` 调用（`confirmDispatch=true` 是代码级门槛，不是提示词约定）。
+4. **t2d_status** —— 轮询到 `RUNNING` 才有 ssh / 服务链接；链接从返回里读，绝不拿 job id 拼 URL。
+5. **t2d_exec**（可选）—— 在 RUNNING 容器里经 SSH 跑一条命令、取小产物；真正的大训练更推荐直接编进 `TASK` 下发。
+6. **t2d_stop** —— 收尾或取消。`TASK` 停止即终止，`WORKSPACE` 之后可重启。
+
+容器内的数据落点：`/output` 跨重启持久、是工作目录；`/input0`–`/input4` 只读挂数据集；二者之外都是会丢的系统盘。
+
 ## 安装
 
 ```sh
