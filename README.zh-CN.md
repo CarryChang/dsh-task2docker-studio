@@ -1,5 +1,7 @@
 # dsh-task2docker-studio
 
+[English](README.md) · **简体中文**
+
 [DeepSeek Harness](https://github.com/deepseek-ai) 的「任务转容器」插件：把计算从性能较弱或安全受限的宿主机，卸载到**你自己拥有的服务器**上执行。宿主机只做控制端——注册一台 runner、下发任务、跟进结果。
 
 **不绑定任何厂家。** runner 就是你用 SSH 能连上的任意机器：云服务器、GPU 机器、集群登录节点。无需第三方 API key。

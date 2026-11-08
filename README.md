@@ -1,5 +1,7 @@
 # dsh-task2docker-studio
 
+**English** · [简体中文](README.zh-CN.md)
+
 Task-to-Docker studio plugin for [DeepSeek Harness](https://github.com/deepseek-ai): offload compute from a weak or security-constrained host onto **servers you already control**. The host stays a controller — it registers a runner, sends a task, and follows the result.
 
 **Vendor-neutral.** A runner is any machine you can reach over SSH: a cloud server, a GPU box, a cluster entry node. No specific provider, no API key to a third party.
