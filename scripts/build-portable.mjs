@@ -30,17 +30,26 @@ const header = [
 ].join('\n')
 
 /**
- * Collect every static import / re-export specifier in a compiled module.
+ * Collect module specifiers from real import/export/require statements only. The patterns are anchored
+ * so prose like `copy from "${name}"` inside a template string is not mistaken for a module dependency.
  * @param text - the compiled JavaScript source.
  * @returns the specifier strings.
  */
 function specifiers(text) {
   const found = []
-  const pattern = /(?:from|import)\s*['"]([^'"]+)['"]/g
-  let match
-  while ((match = pattern.exec(text)) !== null) {
-    const raw = match[1]
-    if (raw) found.push(raw)
+  const patterns = [
+    /(?:^|[;\s])import\s+[^'";]*?from\s*['"]([^'"]+)['"]/g,
+    /(?:^|[;\s])import\s*['"]([^'"]+)['"]/g,
+    /(?:^|[;\s])export\s+[^'";]*?from\s*['"]([^'"]+)['"]/g,
+    /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+  ]
+  for (const pattern of patterns) {
+    let match
+    while ((match = pattern.exec(text)) !== null) {
+      const raw = match[1]
+      if (raw) found.push(raw)
+    }
   }
   return found
 }

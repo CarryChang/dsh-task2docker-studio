@@ -3,7 +3,7 @@ name: dsh-task2docker-studio
 description: Offload compute from a weak or security-constrained host onto servers you control. Register any SSH-reachable runner (a cloud server, a GPU box, a cluster node), dispatch a command to it as a detached Docker container for isolation or backgrounded on the host, then follow status, logs and stop. Use when the user wants work to run on another machine they ssh into. Ships a stdlib CLI so it works in Claude Code, Cursor, Copilot and other Agent-Skills agents with no DeepSeek Harness.
 license: MIT
 metadata:
-  version: 0.2.0
+  version: 0.5.0
   author: CarryChang
   homepage: https://github.com/CarryChang/dsh-task2docker-studio
   keywords: remote-compute, docker, ssh, container, task-dispatch, agent-skill
@@ -39,13 +39,19 @@ node scripts/t2d.mjs register --name gpu-box --host 203.0.113.10 --user root --i
 node scripts/t2d.mjs register --name isolated --host 203.0.113.20 --auth sshpass --password-env ISOLATED_PW
 
 # Dispatch a command. With an image it starts a detached container; --native runs on the host instead.
+# --mount host:container binds a staged host path into the container (repeatable; add :ro for read-only).
 node scripts/t2d.mjs run --runner gpu-box --command "python train.py"
+node scripts/t2d.mjs run --runner gpu-box --command "python /data/src/train.py" --mount /data/src:/workspace
 node scripts/t2d.mjs run --runner gpu-box --command "pytest -q" --native
+
+# Move files: push code/data/skill to the runner, pull artifacts back (--recursive for folders).
+node scripts/t2d.mjs copyto    --runner gpu-box --local ./src --remote /data/src --recursive
+node scripts/t2d.mjs copyfrom  --runner gpu-box --remote /data/out --local ./out --recursive
 
 # Follow up.
 node scripts/t2d.mjs list
 node scripts/t2d.mjs status --job <id>
-node scripts/t2d.mjs logs   --job <id> --tail 80
+node scripts/t2d.mjs logs   --job <id> --tail 80 --follow 60   # live-sample 60s then return
 node scripts/t2d.mjs stop   --job <id>
 node scripts/t2d.mjs remove --name isolated
 ```

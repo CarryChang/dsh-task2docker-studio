@@ -9,9 +9,11 @@
  *                         [--password-env <VAR>] [--password-file <path>] [--image <img>] [--labels a,b]
  *   node t2d.mjs list
  *   node t2d.mjs remove --name <n>
- *   node t2d.mjs run    --runner <n> --command "<cmd>" [--image <img>] [--native]   (or pipe command on stdin)
+ *   node t2d.mjs run    --runner <n> --command "<cmd>" [--image <img>] [--native] [--mount host:container[:ro]]...
  *   node t2d.mjs status --job <id>
- *   node t2d.mjs logs   --job <id> [--tail 100]
+ *   node t2d.mjs logs   --job <id> [--tail 100] [--follow <sec>]
+ *   node t2d.mjs copyto   --runner <n> --local <path> --remote <path> [--recursive]
+ *   node t2d.mjs copyfrom --runner <n> --remote <path> --local <path> [--recursive]
  *   node t2d.mjs stop   --job <id>
  *
  * State (runners + jobs) lives in $T2D_STATE_DIR or ~/.dsh-task2docker. Passwords are read at call time
@@ -25,26 +27,48 @@ import { createSshClient } from './lib/backend/ssh.js'
 import { Store } from './lib/backend/registry.js'
 import { Task2DockerEngine } from './lib/backend/engine.js'
 
-/** Parse `--flag value`, valueless `--flag` (boolean), and a trailing positional into a map. */
+/** Parse `--flag value`, valueless `--flag` (boolean), and a trailing positional into a map.
+ * A repeated flag accumulates into an array (used for --mount). */
 function parseArgs(argv) {
   const flags = {}
   const positional = []
+  const add = (key, value) => {
+    if (!(key in flags)) flags[key] = value
+    else flags[key] = [...[].concat(flags[key]), value]
+  }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
       const next = argv[i + 1]
       if (next !== undefined && !next.startsWith('--')) {
-        flags[key] = next
+        add(key, next)
         i++
       } else {
-        flags[key] = true
+        add(key, true)
       }
     } else {
       positional.push(a)
     }
   }
   return { flags, positional }
+}
+
+/** Normalize a possibly-single or possibly-array flag into an array of strings. */
+function asArray(value) {
+  if (value === undefined || value === true) return []
+  return [].concat(value).filter(v => typeof v === 'string')
+}
+
+/** Parse a `--mount host:container[:ro]` string into a container mount. */
+function parseMount(spec) {
+  const parts = String(spec).split(':')
+  const readonly = parts.at(-1) === 'ro'
+  if (readonly) parts.pop()
+  const host = parts[0] ?? ''
+  const container = parts.slice(1).join(':')
+  if (!host || !container) throw new Error(`bad --mount "${spec}"; expected host:container[:ro]`)
+  return { host, container, readonly }
 }
 
 async function readStdin() {
@@ -99,12 +123,27 @@ async function main() {
         command: cmd,
         image: typeof flags.image === 'string' ? flags.image : undefined,
         native: flags.native === true,
+        mounts: asArray(flags.mount).map(parseMount),
       })
     }
     case 'status':
       return await engine.status(requireFlag('job'))
     case 'logs':
-      return await engine.logs(requireFlag('job'), flags.tail ? Number(flags.tail) : 100)
+      return await engine.logs(requireFlag('job'), flags.tail ? Number(flags.tail) : 100, flags.follow ? Number(flags.follow) : undefined)
+    case 'copyto':
+      return await engine.copyTo({
+        runner: requireFlag('runner'),
+        local: requireFlag('local'),
+        remote: requireFlag('remote'),
+        recursive: flags.recursive === true,
+      })
+    case 'copyfrom':
+      return await engine.copyFrom({
+        runner: requireFlag('runner'),
+        remote: requireFlag('remote'),
+        local: requireFlag('local'),
+        recursive: flags.recursive === true,
+      })
     case 'stop':
       return await engine.stop(requireFlag('job'))
     case undefined:
@@ -113,7 +152,7 @@ async function main() {
     case '-h':
       return { usage: readFileSync(process.argv[1], 'utf8').split('\n').slice(2, 20).join('\n') }
     default:
-      throw new Error(`unknown command "${command}"; try: register | list | remove | run | status | logs | stop`)
+      throw new Error(`unknown command "${command}"; try: register | list | remove | run | status | logs | copyto | copyfrom | stop`)
   }
 }
 

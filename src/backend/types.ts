@@ -47,6 +47,16 @@ export interface SshTarget {
 /** Whether a job runs in a container (detached) or directly on the host (backgrounded). */
 export type RunMode = 'container' | 'native'
 
+/** A host path mounted into a container at dispatch time; `readonly` appends `:ro`. */
+export interface ContainerMount {
+  /** Absolute path on the runner host (typically staged there by t2d_copy_to). */
+  host: string
+  /** Absolute mount point inside the container. */
+  container: string
+  /** Mount read-only when true. */
+  readonly?: boolean | undefined
+}
+
 /** Lifecycle states a dispatched job can be observed in. */
 export type JobState = 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'STOPPED' | 'UNKNOWN'
 
@@ -79,8 +89,8 @@ export interface ExecResult {
 }
 
 /**
- * Executes one composed remote command against a runner. The production implementation shells out to
- * `ssh` / `sshpass`; tests inject a fake so the whole engine runs offline.
+ * Executes remote commands and file transfers against a runner. The production implementation shells out
+ * to `ssh` / `scp` (through `sshpass` for password auth); tests inject a fake so the engine runs offline.
  */
 export interface SshClient {
   /**
@@ -89,6 +99,24 @@ export interface SshClient {
    * @returns captured stdout/stderr and the remote exit code.
    */
   run(target: SshTarget, remoteCommand: string): Promise<ExecResult>
+  /**
+   * Push a local file or directory to the runner host.
+   * @param target - resolved SSH endpoint.
+   * @param localPath - path on the host running this plugin.
+   * @param remotePath - destination path on the runner.
+   * @param recursive - copy directories recursively.
+   * @returns the transfer result.
+   */
+  copyTo(target: SshTarget, localPath: string, remotePath: string, recursive: boolean): Promise<ExecResult>
+  /**
+   * Pull a remote file or directory from the runner to the local host.
+   * @param target - resolved SSH endpoint.
+   * @param remotePath - source path on the runner.
+   * @param localPath - destination on the host running this plugin.
+   * @param recursive - copy directories recursively.
+   * @returns the transfer result.
+   */
+  copyFrom(target: SshTarget, remotePath: string, localPath: string, recursive: boolean): Promise<ExecResult>
 }
 
 /** A GraphQL-free, typed failure surfaced to the model as `ok:false`. */

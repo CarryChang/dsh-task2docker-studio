@@ -49,7 +49,8 @@ export class Task2DockerEngine {
     }
     /**
      * Dispatch one command to a runner and track it as a job.
-     * @param args - runner name, command, optional image, and whether to force native (no container).
+     * @param args - runner name, command, optional image, host paths to mount into the container,
+     *   and whether to force native (no container).
      * @returns the created job record.
      */
     async run(args) {
@@ -58,8 +59,11 @@ export class Task2DockerEngine {
             throw new Task2DockerError('A run needs a non-empty command.');
         const id = this.newId();
         const useImage = args.native ? undefined : (args.image ?? runner.defaultImage);
+        if (args.mounts?.length && !useImage) {
+            throw new Task2DockerError('mounts need a container: pass an image (or give the runner a defaultImage), or drop mounts for a native run.');
+        }
         const plan = useImage
-            ? planContainer(id, useImage, args.command)
+            ? planContainer(id, useImage, args.command, args.mounts ?? [])
             : planNative(id, args.command);
         const result = await this.ssh.run(this.target(runner), plan.command);
         if (!result.ok) {
@@ -96,13 +100,41 @@ export class Task2DockerEngine {
         };
         return this.store.putJob(next);
     }
-    /** Read the last `tail` lines of a job's output. */
-    async logs(jobId, tail) {
+    /**
+     * Push a local file or directory to a runner host (e.g. code or a skill to stage before a run).
+     * @param args - runner name, local source, remote destination, recursive flag.
+     * @returns where the files landed and whether the transfer succeeded.
+     */
+    async copyTo(args) {
+        const runner = this.store.getRunner(args.runner);
+        if (!args.local.trim() || !args.remote.trim())
+            throw new Task2DockerError('copy needs a non-empty local and remote path.');
+        const result = await this.ssh.copyTo(this.target(runner), args.local, args.remote, args.recursive ?? false);
+        if (!result.ok)
+            throw new Task2DockerError(`copy to "${runner.name}" failed: ${firstLine(result.stderr || result.stdout) || `exit ${result.exitCode}`}`);
+        return { runner: runner.name, local: args.local, remote: args.remote };
+    }
+    /**
+     * Pull a file or directory from a runner host back to the local machine (e.g. task artifacts).
+     * @param args - runner name, remote source, local destination, recursive flag.
+     * @returns where the files landed and whether the transfer succeeded.
+     */
+    async copyFrom(args) {
+        const runner = this.store.getRunner(args.runner);
+        if (!args.local.trim() || !args.remote.trim())
+            throw new Task2DockerError('copy needs a non-empty local and remote path.');
+        const result = await this.ssh.copyFrom(this.target(runner), args.remote, args.local, args.recursive ?? false);
+        if (!result.ok)
+            throw new Task2DockerError(`copy from "${runner.name}" failed: ${firstLine(result.stderr || result.stdout) || `exit ${result.exitCode}`}`);
+        return { runner: runner.name, remote: args.remote, local: args.local };
+    }
+    /** Read the output of a job; `followSec` live-samples for that window so monitoring returns promptly. */
+    async logs(jobId, tail, followSec) {
         const job = this.store.getJob(jobId);
         const runner = this.store.getRunner(job.runner);
         const probe = job.handle.kind === 'container'
-            ? composeContainerLogs(job.handle.container, tail)
-            : composeNativeLogs(job.handle.log, tail);
+            ? composeContainerLogs(job.handle.container, tail, followSec)
+            : composeNativeLogs(job.handle.log, tail, followSec);
         const result = await this.ssh.run(this.target(runner), probe);
         return { output: result.stdout };
     }
@@ -128,11 +160,11 @@ export class Task2DockerEngine {
         };
     }
 }
-function planContainer(id, image, command) {
+function planContainer(id, image, command, mounts) {
     const container = `t2d-${id}`;
     return {
         mode: 'container',
-        command: composeContainerStart(container, image, command),
+        command: composeContainerStart(container, image, command, mounts),
         request: `docker run ${image}: ${command}`,
         handle: () => ({ kind: 'container', container }),
     };

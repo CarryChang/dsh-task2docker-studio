@@ -18,16 +18,27 @@ work runs, start it, watch it, stop it. Confirm before you start anything heavy.
 ## Fixed call order
 
 1. `t2d_list_runners` to see what is already registered. If none, ask the user for the server and use `t2d_register_runner` to add it: name, host, optional port (22) and user (root), auth `key` or `sshpass`, and optionally a `defaultImage` so later runs containerize automatically.
-2. `t2d_run` to dispatch one command to a named runner. It starts and tracks a job and returns a job id. With an image (per-call or the runner default) it runs as a detached container; without one it runs backgrounded on the host. Restate what will run where, and the resource cost, before a heavy run.
-3. `t2d_status` with the job id to observe RUNNING / SUCCEEDED / FAILED / STOPPED and the exit code.
-4. `t2d_logs` for the last lines of output when you need to show or diagnose results.
-5. `t2d_stop` to cancel a job the user no longer wants running.
-6. `t2d_remove_runner` only when the user asks to forget a server.
+2. `t2d_copy_to` when the task needs local code, data or a skill on the runner. Push it to a host path, then bind that path into the container with `t2d_run` mounts — never paste file contents through commands.
+3. `t2d_run` to dispatch one command to a named runner. It starts and tracks a job and returns a job id. With an image (per-call or the runner default) it runs as a detached container; without one it runs backgrounded on the host. Restate what will run where, and the resource cost, before a heavy run.
+4. `t2d_status` (RUNNING / SUCCEEDED / FAILED / STOPPED + exit code) and `t2d_logs` to watch how the in-container task runs — a one-shot tail, or a bounded `follow` window that live-samples for N seconds then returns.
+5. `t2d_copy_from` to pull artifacts (checkpoints, reports, outputs) back to the local machine.
+6. `t2d_stop` to cancel a job; `t2d_remove_runner` only to forget a server.
 
 ## Container vs native
 
 - **Container** is the default when an image exists: isolation, a clean filesystem, no leftover host state. Recommended for untrusted or experimental work.
 - **Native** (`t2d_run` with `native: true`, or a runner with no image) runs the command directly on the host, backgrounded with a log file. Use it when the work must touch host state or no container runtime is set up.
+
+## Getting files on and off the runner
+
+- Send code, datasets or a skill with `t2d_copy_to` (recursive for folders), then make it visible inside a container with `t2d_run` mounts: each mount maps a host path to a container path, optionally read-only. The normal sequence is copy_to a host directory, then mount it.
+- Bring results back with `t2d_copy_from` — checkpoints, reports, anything the task wrote to a host path or a mounted directory.
+- mounts require a container run; a native (no-image) run has nothing to mount.
+
+## Monitoring in-container execution
+
+- `t2d_status` reports the job state and exit code.
+- `t2d_logs` tails recent output; pass a `follow` window to live-sample the container or host log for a bounded number of seconds and return, which is how you watch a long task progress without blocking forever.
 
 ## Runner registration and secrets
 

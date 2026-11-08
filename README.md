@@ -22,12 +22,14 @@ The skill and its tools ship in the open Agent Skills format under [`skills/dsh-
 | `t2d_register_runner` | Add a runner: name, host, port, user, auth (`key`/`sshpass`), optional default image |
 | `t2d_list_runners` | Show registered runners (credential pointers only, never the secret) |
 | `t2d_remove_runner` | Forget a runner |
-| `t2d_run` | Dispatch a command to a runner → a tracked job (container or native) |
+| `t2d_copy_to` | Push a local file/dir (code, data, a skill) to a runner over scp |
+| `t2d_copy_from` | Pull artifacts (checkpoints, reports) from a runner back to the host |
+| `t2d_run` | Dispatch a command to a runner → a tracked job (container or native); optionally bind host paths into the container via `mounts` |
 | `t2d_status` | Poll a job: RUNNING / SUCCEEDED / FAILED / STOPPED + exit code |
-| `t2d_logs` | Tail a job's output |
+| `t2d_logs` | Tail a job's output, or live-follow it for a bounded window to watch a running task |
 | `t2d_stop` | Stop a job |
 
-Plus a bundled skill (`task2docker-studio`) that teaches the loop: list → register → confirm → run → status → logs → stop, with container-vs-native and secrecy rules.
+Plus a bundled skill (`task2docker-studio`) that teaches the loop: list → register → copy_to → run (with mounts) → status → logs → copy_from → stop, with container-vs-native, file-transfer and secrecy rules.
 
 ## Install (DeepSeek Harness)
 
@@ -76,6 +78,14 @@ Or declare them in the profile's `cordis.yml` so they are ready on load:
 > run npm ci && npm test on my build server and tail the log
 ```
 
+Send local code to a runner and mount it into the container, then watch the task as it runs and pull the
+result back:
+
+```
+> 把本地 ./src 目录传到 gpu-box 的 /data/src，然后挂载进容器跑 python /data/src/train.py，
+> 实时看 60 秒日志，跑完把 /data/out 拉回本地
+```
+
 ## Architecture
 
 ```
@@ -84,9 +94,9 @@ src/
   skill.ts             embedded task-to-runner methodology
   backend/             DSH-free, offline-testable
     types.ts           Runner, SshTarget, JobRecord, ExecResult, SshClient, Task2DockerError
-    ssh.ts             shell quoting, docker/native command composition, ssh+sshpass argv, SSH client
+    ssh.ts             shell quoting, docker/native command composition, ssh/scp/sshpass argv, SSH client
     registry.ts        runner + job JSON store; password-pointer resolution
-    engine.ts          Task2DockerEngine: register / list / remove / run / status / logs / stop
+    engine.ts          Task2DockerEngine: register / list / remove / copyTo / copyFrom / run / status / logs / stop
 scripts/
   smoke.ts             offline deterministic smoke (fake SSH client + temp store)
   build-portable.mjs   derive the Agent-Skill CLI runtime from compiled DSH-free modules

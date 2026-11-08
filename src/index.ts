@@ -19,6 +19,7 @@ import { createSshClient } from './backend/ssh.ts'
 import { Store } from './backend/registry.ts'
 import { Task2DockerEngine } from './backend/engine.ts'
 import { Task2DockerError, type Runner } from './backend/types.ts'
+import type { ContainerMount } from './backend/types.ts'
 import type { RunnerInput } from './backend/registry.ts'
 
 export const name = 'task2docker'
@@ -194,14 +195,33 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       command: { ...STRING_PARAM, required: true, description: 'Shell command to run on the runner.' },
       image: { ...STRING_PARAM, description: 'Container image for this run; overrides the runner default.' },
       native: { type: 'boolean', description: 'Force running on the host without a container.' },
+      mounts: {
+        type: 'array',
+        description: 'Host paths to bind into the container (stage files first with t2d_copy_to, then mount them). Requires a container run.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            host: { type: 'string', required: true, description: 'Absolute path on the runner host.' },
+            container: { type: 'string', required: true, description: 'Absolute mount point inside the container.' },
+            readonly: { type: 'boolean', description: 'Mount read-only.' },
+          },
+        },
+      },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => engine.run({ runner: args.runner, command: args.command, image: args.image, native: args.native })),
+    execute: args => guarded(() => engine.run({
+      runner: args.runner,
+      command: args.command,
+      image: args.image,
+      native: args.native,
+      mounts: args.mounts as ContainerMount[] | undefined,
+    })),
     presentCall: args => ({
       card: 'generic',
       title: `Run on ${args.runner}`,
       kind: 'execute',
-      rawInput: { runner: args.runner, command: args.command, image: args.image ?? 'default', native: args.native ?? false },
+      rawInput: { runner: args.runner, command: args.command, image: args.image ?? 'default', native: args.native ?? false, mounts: args.mounts?.length ?? 0 },
     }),
   })))
 
@@ -222,10 +242,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     parameters: {
       jobId: { ...STRING_PARAM, required: true, description: 'Job id from t2d_run.' },
       tail: { type: 'integer', description: 'Number of trailing lines to fetch; default 100.' },
+      follow: { type: 'integer', description: 'Live-sample the log for this many seconds then stop; omit for a one-shot tail.' },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => engine.logs(args.jobId, args.tail ?? 100)),
-    presentCall: args => ({ card: 'generic', title: `Logs of job ${args.jobId}`, kind: 'fetch', rawInput: { jobId: args.jobId, tail: args.tail ?? 100 } }),
+    execute: args => guarded(() => engine.logs(args.jobId, args.tail ?? 100, args.follow)),
+    presentCall: args => ({ card: 'generic', title: `Logs of job ${args.jobId}`, kind: 'fetch', rawInput: { jobId: args.jobId, tail: args.tail ?? 100, follow: args.follow ?? 0 } }),
   })))
 
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -237,5 +258,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     output: { schema: { type: 'string' }, render: jsonRender },
     execute: args => guarded(() => engine.stop(args.jobId)),
     presentCall: args => ({ card: 'generic', title: `Stop job ${args.jobId}`, kind: 'execute', rawInput: { jobId: args.jobId } }),
+  })))
+
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 't2d_copy_to',
+    description:
+      'Push a local file or directory to a runner host over scp (recursive for directories). Use it to send local ' +
+      'code, data or a skill to the machine before running it there — typically copy_to first, then t2d_run with ' +
+      'mounts that bind the staged host path into the container.',
+    parameters: {
+      runner: { ...STRING_PARAM, required: true, description: 'Runner name from t2d_list_runners.' },
+      local: { ...STRING_PARAM, required: true, description: 'Local file or directory path.' },
+      remote: { ...STRING_PARAM, required: true, description: 'Destination path on the runner host.' },
+      recursive: { type: 'boolean', description: 'Copy a directory tree.' },
+    },
+    output: { schema: { type: 'string' }, render: jsonRender },
+    execute: args => guarded(() => engine.copyTo({ runner: args.runner, local: args.local, remote: args.remote, recursive: args.recursive })),
+    presentCall: args => ({ card: 'generic', title: `Upload to ${args.runner}`, kind: 'execute', rawInput: { runner: args.runner, local: args.local, remote: args.remote, recursive: args.recursive ?? false } }),
+  })))
+
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 't2d_copy_from',
+    description:
+      'Pull a file or directory from a runner host back to the local machine over scp (recursive for directories). ' +
+      'Use it to fetch task artifacts — checkpoints, reports, outputs written under the container/host path.',
+    parameters: {
+      runner: { ...STRING_PARAM, required: true, description: 'Runner name from t2d_list_runners.' },
+      remote: { ...STRING_PARAM, required: true, description: 'Source path on the runner host.' },
+      local: { ...STRING_PARAM, required: true, description: 'Destination on the local machine.' },
+      recursive: { type: 'boolean', description: 'Copy a directory tree.' },
+    },
+    output: { schema: { type: 'string' }, render: jsonRender },
+    execute: args => guarded(() => engine.copyFrom({ runner: args.runner, remote: args.remote, local: args.local, recursive: args.recursive })),
+    presentCall: args => ({ card: 'generic', title: `Download from ${args.runner}`, kind: 'execute', rawInput: { runner: args.runner, remote: args.remote, local: args.local, recursive: args.recursive ?? false } }),
   })))
 }

@@ -22,23 +22,25 @@
 | `t2d_register_runner` | 登记 runner：name、host、port、user、auth（`key`/`sshpass`）、可选默认镜像 |
 | `t2d_list_runners` | 列出已登记 runner（只显示凭据指针，绝不显示密钥） |
 | `t2d_remove_runner` | 忘记一台 runner |
-| `t2d_run` | 把一条命令下发到 runner → 一个受跟踪的 job（容器或原生） |
+| `t2d_copy_to` | 把本地文件/目录（代码、数据、skill）通过 scp 推到 runner |
+| `t2d_copy_from` | 把产物（checkpoint、报告）从 runner 拉回本地 |
+| `t2d_run` | 把一条命令下发到 runner → 受跟踪的 job（容器或原生）；可用 `mounts` 把宿主机路径挂进容器 |
 | `t2d_status` | 轮询 job：RUNNING / SUCCEEDED / FAILED / STOPPED + 退出码 |
-| `t2d_logs` | 取 job 输出末尾若干行 |
+| `t2d_logs` | 取 job 输出末尾若干行，或在限定秒数内实时跟随，监控容器内任务执行 |
 | `t2d_stop` | 停止 job |
 
-外加内置技能（`task2docker-studio`），教授闭环：list → register → 确认 → run → status → logs → stop，含容器 vs 原生与保密规则。
+外加内置技能（`task2docker-studio`），教授闭环：list → register → copy_to → run(带 mounts) → status → logs → copy_from → stop，含容器 vs 原生、文件传输与保密规则。
 
 ## 核心工作流
 
 固定闭环，宿主机始终只当控制端：
 
 1. **t2d_list_runners** —— 先看有没有已登记的机器；没有就问用户要服务器信息，用 **t2d_register_runner** 添加：name、host，可选 port（22）/user（root）/auth，并可给一个 defaultImage，之后下发自动进容器。
-2. **t2d_run** —— 把一条命令下发到指定 runner，后台起一个 job 并返回 job id。有镜像（当次或 runner 默认且未强制原生）就以分离式 Docker 容器跑；否则在宿主机 nohup 后台跑。重活或破坏性命令先复述「在哪跑、跑什么、代价」再动手。
-3. **t2d_status** —— 用 job id 查 RUNNING / SUCCEEDED / FAILED / STOPPED 与退出码。
-4. **t2d_logs** —— 需要展示或排错时取输出末尾若干行。
-5. **t2d_stop** —— 用户不想要了取消。容器走 `docker rm`，原生走 `kill`。
-6. **t2d_remove_runner** —— 仅在用户要忘记某台服务器时用。
+2. **t2d_copy_to** —— 任务需要本地代码/数据/skill 时，先把文件 scp 到 runner 的某个宿主机路径，再用 **t2d_run** 的 `mounts` 把它挂进容器；不要把文件内容内联进命令。
+3. **t2d_run** —— 把一条命令下发到指定 runner，后台起一个 job 并返回 job id。有镜像就以分离式 Docker 容器跑；否则 nohup 后台跑。重活或破坏性命令先复述「在哪跑、跑什么、代价」再动手。
+4. **t2d_status** + **t2d_logs** —— 用 job id 查状态与退出码；`t2d_logs` 可取末尾日志，也可给一个 `follow` 秒数窗口实时跟随，在不阻塞的前提下监控容器内任务的执行进展。
+5. **t2d_copy_from** —— 把 checkpoint、报告等产物从 runner 拉回本地。
+6. **t2d_stop** / **t2d_remove_runner** —— 取消任务（容器 `docker rm`、原生 `kill`）；仅在用户要忘记服务器时才 remove。
 
 ## 安装（DeepSeek Harness）
 
@@ -85,6 +87,15 @@ dsh plugin --profile web add https://github.com/CarryChang/dsh-task2docker-studi
 > 把 ./train.py 丢到 gpu-box 上用 pytorch:2.4 镜像跑起来，跑完告诉我状态
 > 这段不受信任的脚本别在我本机跑，去 isolated 上开个容器执行，只看输出
 > 在我构建机上跑 npm ci && npm test，并把日志 tail 回来
+```
+
+把本地代码传到 runner、挂载进容器、实时跟随日志、再拉回产物：
+
+```sh
+node scripts/t2d.mjs copyto --runner gpu-box --local ./src --remote /data/src --recursive
+node scripts/t2d.mjs run --runner gpu-box --command "python /data/src/train.py" --mount /data/src:/workspace
+node scripts/t2d.mjs logs --job <id> --follow 60 --tail 80
+node scripts/t2d.mjs copyfrom --runner gpu-box --remote /data/out --local ./out --recursive
 ```
 
 ## 架构

@@ -1,7 +1,7 @@
 {
   "name": "dsh-task2docker-studio",
-  "description": "Task-to-Docker studio for DeepSeek Harness: offload work from a weak or security-constrained host onto the user's own servers. Register any SSH-reachable runner, then dispatch a command to it as a detached Docker container (isolation) or backgrounded on the host, and follow status, logs and stop. Vendor-neutral — a cloud server you can ssh into is enough.",
-  "version": "0.2.0",
+  "description": "Task-to-Docker studio for DeepSeek Harness: offload work from a weak or security-constrained host onto the user's own servers. Register any SSH-reachable runner, push local files/skills with scp and mount them into a container, dispatch a command as a detached Docker container (isolation) or backgrounded on the host, monitor it via status and live log follow, pull artifacts back, and stop. Vendor-neutral — a cloud server you can ssh into is enough.",
+  "version": "0.5.0",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",

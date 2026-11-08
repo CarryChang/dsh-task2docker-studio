@@ -9,8 +9,8 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  shQuote, composeContainerStart, composeContainerStatus, composeNativeStart,
-  buildSshArgv, buildSshPassArgv,
+  shQuote, composeContainerStart, composeContainerStatus, composeNativeStart, composeContainerLogs,
+  buildSshArgv, buildSshPassArgv, buildScpToArgv, buildScpFromArgv,
 } from '../src/backend/ssh.ts'
 import { normalizeRunner, resolvePassword, Store } from '../src/backend/registry.ts'
 import { Task2DockerEngine } from '../src/backend/engine.ts'
@@ -21,7 +21,16 @@ import { SKILL_BODY } from '../src/skill.ts'
 assert.equal(shQuote("it's"), `'it'\\''s'`)
 const cstart = composeContainerStart('t2d-abc', 'pytorch:2.4', 'python train.py')
 assert.match(cstart, /^docker run -d --name 't2d-abc' 'pytorch:2\.4' bash -lc 'python train\.py'$/)
+// container start binds host:container mounts, with :ro for a read-only mount, before the image.
+const mounted = composeContainerStart('t2d-abc', 'pytorch:2.4', 'python /workspace/train.py', [
+  { host: '/data/src', container: '/workspace' },
+  { host: '/data/models', container: '/models', readonly: true },
+])
+assert.ok(mounted.includes("-v '/data/src:/workspace' -v '/data/models:/models:ro' 'pytorch:2.4'"), 'mounts rendered before image, ro suffix applied')
 assert.match(composeContainerStatus('t2d-abc'), /docker inspect -f/)
+// bounded follow wraps the live tail in a remote timeout so one tool call returns promptly.
+assert.match(composeContainerLogs('t2d-abc', 80, 60), /^timeout -s INT 60 docker logs -f --tail 80 't2d-abc' 2>&1 \|\| true$/)
+assert.equal(composeContainerLogs('t2d-abc', 80), "docker logs --tail 80 't2d-abc' 2>&1")
 assert.match(composeNativeStart('sleep 100', '/tmp/t2d-x.log'), /nohup bash -lc 'sleep 100' > '\/tmp\/t2d-x\.log' 2>&1 & echo \$!$/)
 
 const target: SshTarget = { host: '203.0.113.10', port: 2200, user: 'root', auth: 'key' }
@@ -32,6 +41,17 @@ assert.ok(keyArgv.includes('BatchMode=yes'))
 assert.equal(keyArgv[keyArgv.length - 1], 'ls')
 const pwArgv = buildSshPassArgv(target, 'ls', '/tmp/pw')
 assert.deepEqual(pwArgv.slice(0, 3), ['-f', '/tmp/pw', 'ssh'])
+assert.ok(!pwArgv.includes('BatchMode=yes'), 'sshpass path must not disable password auth via BatchMode')
+// scp builders use the uppercase -P port flag and user@host:path addressing.
+const scpTo = buildScpToArgv(target, './src', '/data/src', true)
+assert.ok(scpTo.includes('-P') && scpTo.includes('2200'))
+assert.ok(scpTo.includes('-r'))
+assert.equal(scpTo.at(-2), './src')
+assert.equal(scpTo.at(-1), 'root@203.0.113.10:/data/src')
+const scpFrom = buildScpFromArgv(target, '/data/out', './out', false)
+assert.ok(!scpFrom.includes('-r'))
+assert.equal(scpFrom.at(-2), 'root@203.0.113.10:/data/out')
+assert.equal(scpFrom.at(-1), './out')
 
 // --- runner normalization + password pointer resolution ---------------------
 const norm = normalizeRunner({ name: ' gpu1 ', host: ' 10.0.0.5 ' })
@@ -55,11 +75,14 @@ rmSync(pwFilePath, { force: true })
 // --- fake SSH client driving the engine -------------------------------------
 function makeFake() {
   const calls: Array<{ target: SshTarget; command: string }> = []
+  const transfers: Array<{ dir: 'to' | 'from'; target: SshTarget; local: string; remote: string; recursive: boolean }> = []
   let next: ExecResult = { ok: true, exitCode: 0, stdout: '', stderr: '' }
   const ssh: SshClient = {
     async run(t, c) { calls.push({ target: t, command: c }); return next },
+    async copyTo(t, local, remote, recursive) { transfers.push({ dir: 'to', target: t, local, remote, recursive }); return next },
+    async copyFrom(t, remote, local, recursive) { transfers.push({ dir: 'from', target: t, local, remote, recursive }); return next },
   }
-  return { ssh, calls, setNext: (r: Partial<ExecResult>) => { next = { ok: true, exitCode: 0, stdout: '', stderr: '', ...r } } }
+  return { ssh, calls, transfers, setNext: (r: Partial<ExecResult>) => { next = { ok: true, exitCode: 0, stdout: '', stderr: '', ...r } } }
 }
 
 const stateDir = mkdtempSync(join(tmpdir(), 't2d-smoke-'))
@@ -89,6 +112,17 @@ try {
   assert.equal(native.mode, 'native')
   assert.ok(native.handle.kind === 'native' && native.handle.pid === '4242')
 
+  // container run with mounts: staged host paths bind into the container
+  fake.setNext({ ok: true, exitCode: 0, stdout: 'cid\n', stderr: '' })
+  const mountedJob = await engine.run({
+    runner: 'gpu1', command: 'python /workspace/train.py',
+    mounts: [{ host: '/data/src', container: '/workspace', readonly: true }],
+  })
+  assert.equal(mountedJob.mode, 'container')
+  assert.ok(fake.calls.at(-1)!.command.includes("-v '/data/src:/workspace:ro'"), 'container run binds the staged host path read-only')
+  // native run cannot mount
+  await assert.rejects(() => engine.run({ runner: 'plain', command: 'x', native: true, mounts: [{ host: '/a', container: '/b' }] }), /mounts need a container/)
+
   // status parsing
   fake.setNext({ stdout: 'running|-1' })
   assert.equal((await engine.status('001')).state, 'RUNNING')
@@ -108,8 +142,22 @@ try {
   fake.setNext({ stdout: 'epoch 3 loss 0.1\n' })
   assert.equal((await engine.logs('001', 50)).output, 'epoch 3 loss 0.1\n')
   assert.match(fake.calls.at(-1)!.command, /docker logs --tail 50 't2d-001'/)
+  // bounded follow window composes a remote timeout sample
+  await engine.logs('001', 80, 30)
+  assert.match(fake.calls.at(-1)!.command, /^timeout -s INT 30 docker logs -f --tail 80/)
   fake.setNext({ stdout: 'STOPPED\n' })
   assert.equal((await engine.stop('001')).state, 'STOPPED')
+
+  // copy to and from the runner
+  fake.setNext({ ok: true, exitCode: 0, stdout: '', stderr: '' })
+  const up = await engine.copyTo({ runner: 'gpu1', local: './src', remote: '/data/src', recursive: true })
+  assert.deepEqual(up, { runner: 'gpu1', local: './src', remote: '/data/src' })
+  assert.equal(fake.transfers.at(-1)!.dir, 'to')
+  assert.equal(fake.transfers.at(-1)!.recursive, true)
+  await engine.copyFrom({ runner: 'gpu1', remote: '/data/out', local: './out' })
+  assert.equal(fake.transfers.at(-1)!.dir, 'from')
+  fake.setNext({ ok: false, exitCode: 1, stderr: 'No such file\n' })
+  await assert.rejects(() => engine.copyTo({ runner: 'gpu1', local: './nope', remote: '/x' }), /No such file/)
 
   // ledger persists across a fresh Store on the same directory
   const reopened = new Task2DockerEngine(new Store(stateDir), fake.ssh, { idFactory: () => 'zzz', now: () => 'x' })
@@ -138,7 +186,7 @@ try {
 
   // --- skill boot safety -----------------------------------------------------
   assert.ok(!SKILL_BODY.includes('`'), 'SKILL_BODY must not contain raw backticks')
-  for (const tool of ['t2d_register_runner', 't2d_list_runners', 't2d_run', 't2d_status', 't2d_logs', 't2d_stop', 't2d_remove_runner']) {
+  for (const tool of ['t2d_register_runner', 't2d_list_runners', 't2d_run', 't2d_status', 't2d_logs', 't2d_stop', 't2d_remove_runner', 't2d_copy_to', 't2d_copy_from']) {
     assert.ok(SKILL_BODY.includes(tool), `skill body walks through ${tool}`)
   }
   assert.ok(SKILL_BODY.includes('native') && SKILL_BODY.includes('container'), 'skill covers container vs native')

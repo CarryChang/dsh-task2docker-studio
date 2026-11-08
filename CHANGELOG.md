@@ -2,6 +2,22 @@
 
 All notable changes to this project follow the plugin's own versioning.
 
+## 0.5.0
+
+File transfer and log-based monitoring of in-container tasks.
+
+- **New tools** `t2d_copy_to` (scp push a file/dir to a runner, recursive) and `t2d_copy_from` (pull
+  artifacts back), so users can send local code, data or a skill to a server and retrieve results.
+- **Container mounts on `t2d_run`**: a `mounts` list maps host paths to container paths (optionally
+  read-only). The normal flow is copy_to a host directory, then run with that path mounted into the
+  container; native runs reject mounts because there is nothing to bind.
+- **Log follow for monitoring**: `t2d_logs` gains a `follow` window that live-samples the container or
+  native log for a bounded number of seconds then returns, so watching a long task does not block.
+- **sshpass correctness**: password-auth ssh/scp no longer pass `BatchMode=yes`, which would disable the
+  very password prompt sshpass relies on; key auth keeps BatchMode.
+- `SshClient` gained `copyTo` / `copyFrom`; the engine, skill, READMEs and the portable Agent-Skill CLI
+  all cover the new transfer / mount / follow surface.
+
 ## 0.2.0
 
 De-vendored: the tool no longer targets OpenBayes / HyperAI. A runner is now any SSH-reachable machine

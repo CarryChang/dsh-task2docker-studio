@@ -20,18 +20,32 @@ export function shQuote(value) {
  * @param container - deterministic name to launch the container under.
  * @param image - container image.
  * @param cmd - the task command to run inside the container.
+ * @param mounts - host paths to bind into the container (e.g. code or skills staged by t2d_copy_to).
  * @returns a single remote shell command string.
  */
-export function composeContainerStart(container, image, cmd) {
-    return `docker run -d --name ${shQuote(container)} ${shQuote(image)} bash -lc ${shQuote(cmd)}`;
+export function composeContainerStart(container, image, cmd, mounts = []) {
+    const volumes = mounts.map(m => `-v ${shQuote(`${m.host}:${m.container}${m.readonly ? ':ro' : ''}`)}`).join(' ');
+    const volumePart = volumes ? `${volumes} ` : '';
+    return `docker run -d --name ${shQuote(container)} ${volumePart}${shQuote(image)} bash -lc ${shQuote(cmd)}`;
 }
 /** Build a `docker inspect` that reports state and exit code as `status|exitCode`. */
 export function composeContainerStatus(container) {
     return `docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}' ${shQuote(container)} 2>/dev/null || echo MISSING|-1`;
 }
-/** Build a bounded `docker logs` read. */
-export function composeContainerLogs(container, tail) {
-    return `docker logs --tail ${Math.max(1, Math.trunc(tail))} ${shQuote(container)} 2>&1`;
+/**
+ * Build a bounded `docker logs` read; with `followSec` it live-samples for that window then stops, so
+ * monitoring an in-container task returns within one tool call instead of blocking.
+ * @param container - the container name.
+ * @param tail - trailing lines to include.
+ * @param followSec - when set and positive, follow live for this many seconds before stopping.
+ * @returns a single remote shell command string.
+ */
+export function composeContainerLogs(container, tail, followSec) {
+    const t = Math.max(1, Math.trunc(tail));
+    if (followSec && followSec > 0) {
+        return `timeout -s INT ${Math.trunc(followSec)} docker logs -f --tail ${t} ${shQuote(container)} 2>&1 || true`;
+    }
+    return `docker logs --tail ${t} ${shQuote(container)} 2>&1`;
 }
 /** Build a container remove (force, so RUNNING containers stop too). */
 export function composeContainerStop(container) {
@@ -50,9 +64,19 @@ export function composeNativeStart(cmd, log) {
 export function composeNativeStatus(pid, log) {
     return `if kill -0 ${shQuote(pid)} 2>/dev/null; then echo RUNNING|-1; else echo DONE|$(tail -n 1 ${shQuote(log)} 2>/dev/null | tr -d '\\r'); fi`;
 }
-/** Build a bounded tail of a native run's log. */
-export function composeNativeLogs(log, tail) {
-    return `tail -n ${Math.max(1, Math.trunc(tail))} ${shQuote(log)} 2>&1`;
+/**
+ * Build a bounded tail of a native run's log; `followSec` live-samples for that window then stops.
+ * @param log - host path of the backgrounded command's log.
+ * @param tail - trailing lines to include.
+ * @param followSec - when set and positive, follow for this many seconds before stopping.
+ * @returns a single remote shell command string.
+ */
+export function composeNativeLogs(log, tail, followSec) {
+    const t = Math.max(1, Math.trunc(tail));
+    if (followSec && followSec > 0) {
+        return `timeout -s INT ${Math.trunc(followSec)} tail -f -n ${t} ${shQuote(log)} 2>&1 || true`;
+    }
+    return `tail -n ${t} ${shQuote(log)} 2>&1`;
 }
 /** Build a native stop (best-effort kill) from a recorded PID. */
 export function composeNativeStop(pid) {
@@ -76,6 +100,8 @@ export function buildSshArgv(target, remoteCommand) {
 }
 /**
  * Build the `sshpass` argv for password auth, reading the secret from a file, never the command line.
+ * BatchMode is intentionally omitted: `BatchMode=yes` disables password authentication, which would
+ * defeat sshpass feeding the password at the prompt.
  * @param target - resolved endpoint.
  * @param remoteCommand - command to run remotely.
  * @param passwordFile - path to a 0600 file holding the password.
@@ -84,8 +110,48 @@ export function buildSshArgv(target, remoteCommand) {
 export function buildSshPassArgv(target, remoteCommand, passwordFile) {
     return [
         '-f', passwordFile,
-        'ssh', ...buildSshArgv(target, remoteCommand),
+        'ssh',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'ServerAliveInterval=30',
+        '-p', String(target.port),
+        `${target.user}@${target.host}`,
+        remoteCommand,
     ];
+}
+/**
+ * Common `scp` options: host-key policy and the uppercase `-P` port flag (lowercase `-p` on scp means
+ * preserve-mtime, a different thing). BatchMode only for key auth, mirroring the ssh builders.
+ * @param target - resolved endpoint.
+ * @returns argv option prefix.
+ */
+function scpOptions(target) {
+    const opts = ['-o', 'StrictHostKeyChecking=accept-new'];
+    if (target.auth === 'key')
+        opts.push('-o', 'BatchMode=yes');
+    opts.push('-P', String(target.port));
+    return opts;
+}
+/**
+ * Build the `scp` argv that pushes a local path to the runner.
+ * @param target - resolved endpoint.
+ * @param localPath - source on the local host.
+ * @param remotePath - `path` on the runner (no `user@host:` prefix; it is added here).
+ * @param recursive - add `-r` for directories.
+ * @returns argv passed to the `scp` binary.
+ */
+export function buildScpToArgv(target, localPath, remotePath, recursive) {
+    return [...scpOptions(target), ...(recursive ? ['-r'] : []), localPath, `${target.user}@${target.host}:${remotePath}`];
+}
+/**
+ * Build the `scp` argv that pulls a remote path from the runner to the local host.
+ * @param target - resolved endpoint.
+ * @param remotePath - `path` on the runner.
+ * @param localPath - destination on the local host.
+ * @param recursive - add `-r` for directories.
+ * @returns argv passed to the `scp` binary.
+ */
+export function buildScpFromArgv(target, remotePath, localPath, recursive) {
+    return [...scpOptions(target), ...(recursive ? ['-r'] : []), `${target.user}@${target.host}:${remotePath}`, localPath];
 }
 /** Default spawner: run a binary to completion, capture output, hard-kill after the per-call timeout. */
 export function defaultSpawn() {
@@ -105,30 +171,49 @@ export function defaultSpawn() {
 }
 /**
  * Create the production SSH client. Password auth requires `sshpass` on the host; the secret is
- * written to a 0600 temp file and removed however the run ends, and is never returned.
+ * written to a 0600 temp file and removed however the call ends, and is never returned.
  * @param timeoutMs - per-command timeout.
  * @param spawnFn - process spawner (default `defaultSpawn()`).
  * @returns an SSH client.
  */
 export function createSshClient(timeoutMs, spawnFn = defaultSpawn()) {
+    /**
+     * Run `bin` against a target, adding sshpass password handling when the target uses sshpass auth.
+     * @param target - resolved endpoint.
+     * @param bin - the binary (`ssh` or `scp`).
+     * @param keyArgv - argv for key auth.
+     * @param passwordArgv - argv builder for the sshpass path, given the temp password file.
+     * @returns the captured result.
+     */
+    async function authed(target, bin, keyArgv, passwordArgv) {
+        if (target.auth === 'key') {
+            return spawnFn(bin, keyArgv, timeoutMs);
+        }
+        if (!target.password) {
+            throw new Task2DockerError(`Runner ssh target for ${target.host} uses sshpass but no password was resolved. Set the runner's passwordEnv or passwordFile.`);
+        }
+        const dir = mkdtempSync(join(tmpdir(), 't2d-'));
+        const pwFile = join(dir, 'pw');
+        try {
+            writeFileSync(pwFile, target.password, { mode: 0o600 });
+            chmodSync(pwFile, 0o600);
+            return await spawnFn('sshpass', passwordArgv(pwFile), timeoutMs);
+        }
+        finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }
     return {
-        async run(target, remoteCommand) {
-            if (target.auth === 'key') {
-                return spawnFn('ssh', buildSshArgv(target, remoteCommand), timeoutMs);
-            }
-            if (!target.password) {
-                throw new Task2DockerError(`Runner ssh target for ${target.host} uses sshpass but no password was resolved. Set the runner's passwordEnv or passwordFile.`);
-            }
-            const dir = mkdtempSync(join(tmpdir(), 't2d-'));
-            const pwFile = join(dir, 'pw');
-            try {
-                writeFileSync(pwFile, target.password, { mode: 0o600 });
-                chmodSync(pwFile, 0o600);
-                return await spawnFn('sshpass', buildSshPassArgv(target, remoteCommand, pwFile), timeoutMs);
-            }
-            finally {
-                rmSync(dir, { recursive: true, force: true });
-            }
+        run(target, remoteCommand) {
+            return authed(target, 'ssh', buildSshArgv(target, remoteCommand), pwFile => buildSshPassArgv(target, remoteCommand, pwFile));
+        },
+        copyTo(target, localPath, remotePath, recursive) {
+            const argv = buildScpToArgv(target, localPath, remotePath, recursive);
+            return authed(target, 'scp', argv, pwFile => ['-f', pwFile, 'scp', ...argv]);
+        },
+        copyFrom(target, remotePath, localPath, recursive) {
+            const argv = buildScpFromArgv(target, remotePath, localPath, recursive);
+            return authed(target, 'scp', argv, pwFile => ['-f', pwFile, 'scp', ...argv]);
         },
     };
 }
