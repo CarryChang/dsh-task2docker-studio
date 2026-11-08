@@ -1,0 +1,6 @@
+url: https://github.com/CarryChang/dsh-task2docker-studio
+name: CarryChang/dsh-task2docker-studio
+category: tools
+description:
+  en: 'Task-to-Docker studio for DSH: offload compute from a weak or security-constrained host onto servers the user controls. A runner is any SSH-reachable machine; t2d_run dispatches a command as a detached Docker container (isolation) or backgrounded on the host, with scp file transfer (t2d_copy_to / t2d_copy_from), container path mounts, status polling and bounded log-follow to monitor in-container tasks. Vendor-neutral, no third-party API key; credentials are stored only as pointers. Also ships a standalone general Agent Skill (SKILL.md + stdlib CLI) for Claude Code / Cursor / Copilot.'
+  zh: '面向 DSH 的任务转容器工作室：把计算从性能较弱或安全受限的宿主机卸载到用户自己的服务器。runner 就是任意可 SSH 连上的机器；t2d_run 把命令以分离式 Docker 容器（隔离）或在宿主机后台下发，支持 scp 文件传输（t2d_copy_to / t2d_copy_from）、容器路径挂载、状态轮询，以及限时日志跟随来监控容器内任务。厂家中立、无需第三方 API key，凭据只以指针形式保存。同时附带一份通用 Agent Skill（SKILL.md + 纯标准库命令行），可装入 Claude Code / Cursor / Copilot。'
