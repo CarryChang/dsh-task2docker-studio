@@ -1,0 +1,163 @@
+/**
+ * File-backed store for registered runners and dispatched jobs. Secrets are never persisted: a runner
+ * records only the name of an environment variable or the path of a 0600 file from which the password
+ * is resolved at call time. The ledger is plain JSON under the plugin's state directory.
+ * @module dsh-task2docker-studio/backend/registry
+ */
+
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { Task2DockerError, type JobRecord, type Runner } from './types.ts'
+
+/** Shape accepted when registering a runner; only `name` and `host` are mandatory. */
+export interface RunnerInput {
+  name: string
+  host: string
+  port?: number | undefined
+  user?: string | undefined
+  auth?: 'key' | 'sshpass' | undefined
+  passwordEnv?: string | undefined
+  passwordFile?: string | undefined
+  defaultImage?: string | undefined
+  labels?: string[] | undefined
+}
+
+/**
+ * Fill defaults and reject an unusable runner definition before anything is stored.
+ * @param input - raw runner fields.
+ * @returns a normalized {@link Runner}.
+ */
+export function normalizeRunner(input: RunnerInput): Runner {
+  const name = input.name.trim()
+  const host = input.host.trim()
+  if (!name) throw new Task2DockerError('Runner needs a non-empty name.')
+  if (!host) throw new Task2DockerError(`Runner "${name}" needs a host.`)
+  const auth = input.auth ?? 'key'
+  if (auth === 'sshpass' && !input.passwordEnv && !input.passwordFile) {
+    throw new Task2DockerError(`Runner "${name}" uses sshpass auth but sets neither passwordEnv nor passwordFile.`)
+  }
+  return {
+    name,
+    host,
+    port: input.port ?? 22,
+    user: input.user ?? 'root',
+    auth,
+    passwordEnv: input.passwordEnv,
+    passwordFile: input.passwordFile,
+    defaultImage: input.defaultImage,
+    labels: input.labels ?? [],
+  }
+}
+
+/**
+ * Resolve a runner's SSH password now, from the environment variable or the 0600 file it points to.
+ * @param runner - a stored runner.
+ * @param env - process environment to read (injectable for tests).
+ * @param readFile - file reader for `passwordFile` (injectable for tests).
+ * @returns the password, or undefined for key-based auth.
+ */
+export function resolvePassword(
+  runner: Runner,
+  env: Record<string, string | undefined> = process.env,
+  readFile: (path: string) => string = p => readFileSync(p, 'utf8'),
+): string | undefined {
+  if (runner.auth !== 'sshpass') return undefined
+  if (runner.passwordEnv) {
+    const value = env[runner.passwordEnv]
+    if (!value) {
+      throw new Task2DockerError(`Runner "${runner.name}" reads its password from $${runner.passwordEnv}, which is empty right now.`)
+    }
+    return value
+  }
+  if (runner.passwordFile) {
+    if (!existsSync(runner.passwordFile)) {
+      throw new Task2DockerError(`Runner "${runner.name}" password file ${runner.passwordFile} does not exist.`)
+    }
+    return readFile(runner.passwordFile).replace(/\r?\n$/, '')
+  }
+  return undefined
+}
+
+/** Reads and writes the runner and job JSON files for a state directory. */
+export class Store {
+  /**
+   * @param stateDir - directory holding runners.json and jobs.json; created on demand.
+   */
+  constructor(private readonly stateDir: string) {}
+
+  private file(name: string): string {
+    return join(this.stateDir, name)
+  }
+
+  private readMap<T>(name: string): Record<string, T> {
+    const path = this.file(name)
+    if (!existsSync(path)) return {}
+    try {
+      return JSON.parse(readFileSync(path, 'utf8')) as Record<string, T>
+    } catch {
+      throw new Task2DockerError(`State file ${path} is not valid JSON; fix or remove it before using the plugin.`)
+    }
+  }
+
+  private writeMap<T>(name: string, data: Record<string, T>): void {
+    mkdirSync(this.stateDir, { recursive: true })
+    writeFileSync(this.file(name), JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 })
+  }
+
+  /** All registered runners, keyed by name. */
+  runners(): Record<string, Runner> {
+    return this.readMap<Runner>('runners.json')
+  }
+
+  /** Look up one runner by name; reject with an actionable message when absent. */
+  getRunner(name: string): Runner {
+    const runner = this.runners()[name]
+    if (!runner) {
+      const known = Object.keys(this.runners()).join(', ') || 'none yet'
+      throw new Task2DockerError(`No runner named "${name}" is registered. Registered: ${known}. Use t2d_register_runner first.`)
+    }
+    return runner
+  }
+
+  /** Insert or replace a runner, then return the current snapshot. */
+  putRunner(runner: Runner): Record<string, Runner> {
+    const all = this.runners()
+    all[runner.name] = runner
+    this.writeMap('runners.json', all)
+    return all
+  }
+
+  /** Delete a runner by name; false when it was not present. */
+  deleteRunner(name: string): boolean {
+    const all = this.runners()
+    if (!(name in all)) return false
+    delete all[name]
+    this.writeMap('runners.json', all)
+    return true
+  }
+
+  /** All tracked jobs, keyed by id. */
+  jobs(): Record<string, JobRecord> {
+    return this.readMap<JobRecord>('jobs.json')
+  }
+
+  /** Insert or replace a job record, then return it. */
+  putJob(job: JobRecord): JobRecord {
+    const all = this.jobs()
+    all[job.id] = job
+    this.writeMap('jobs.json', all)
+    return job
+  }
+
+  /** Look up one job by id; reject when absent. */
+  getJob(id: string): JobRecord {
+    const job = this.jobs()[id]
+    if (!job) throw new Task2DockerError(`No job "${id}" in the ledger. Start one with t2d_run, or check earlier ids.`)
+    return job
+  }
+
+  /** Remove the whole state directory (used by tests and a future reset tool). */
+  clear(): void {
+    rmSync(this.stateDir, { recursive: true, force: true })
+  }
+}

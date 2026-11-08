@@ -1,7 +1,7 @@
 {
   "name": "dsh-task2docker-studio",
-  "description": "Task-to-Docker studio for DeepSeek Harness: dispatch work from a weak or security-constrained host onto external GPU/container compute. Typed t2d_* tools send a task command to a remote container (OpenBayes / HyperAI Job mode=TASK), poll its status, run one-off commands over SSH, and stop it — the host stays a controller, the container does the compute.",
-  "version": "0.1.0",
+  "description": "Task-to-Docker studio for DeepSeek Harness: offload work from a weak or security-constrained host onto the user's own servers. Register any SSH-reachable runner, then dispatch a command to it as a detached Docker container (isolation) or backgrounded on the host, and follow status, logs and stop. Vendor-neutral — a cloud server you can ssh into is enough.",
+  "version": "0.2.0",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",
@@ -22,6 +22,8 @@
     "cordis.patch.yml",
     "icon.svg",
     "SKILL.md",
+    "skills",
+    "scripts/build-portable.mjs",
     "README.md",
     "README.zh-CN.md",
     "LICENSE",
@@ -55,9 +57,11 @@
     "hyperai"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-portable.mjs",
+    "build:portable": "node scripts/build-portable.mjs",
     "test": "node --import tsx/esm scripts/smoke.ts",
-    "check": "tsc -p tsconfig.json && node --import tsx/esm scripts/smoke.ts"
+    "check": "tsc -p tsconfig.json && node --import tsx/esm scripts/smoke.ts && node scripts/build-portable.mjs && node skills/dsh-task2docker-studio/scripts/t2d.mjs list",
+    "prepack": "tsc -p tsconfig.json && node scripts/build-portable.mjs"
   },
   "engines": {
     "dsh": "^0.2.0-rc.1 || ^0.2.1-rc.1 || ^0.2.2-alpha.2",

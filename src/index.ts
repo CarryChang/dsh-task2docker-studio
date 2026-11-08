@@ -1,68 +1,81 @@
 /**
- * dsh-task2docker-studio Cordis plugin entry. Registers the task-to-container dispatch skill and six
- * t2d_* tools that let a weak or security-constrained host send work to external GPU/container runners
- * (OpenBayes / HyperAI Job compute). The endpoint and token come from config or the environment; the
- * access token and per-job ssh password are consumed internally and never returned to the model.
+ * dsh-task2docker-studio Cordis plugin entry. Registers the task-to-runner dispatch methodology skill
+ * and seven vendor-neutral t2d_* tools: register / list / remove an SSH-reachable runner, run a command
+ * on it (Docker container or native), then poll status, tail logs and stop. Credentials are pointers
+ * only (an env var name or a 0600 file path) and the resolved password never reaches tool output.
  * @module dsh-task2docker-studio
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 // Type-only: pull the ctx.skills and ctx.tools service declarations into the Context graph.
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-tools'
 import { SKILL_NAME, SKILL_DESCRIPTION, SKILL_WHEN_TO_USE, SKILL_BODY } from './skill.ts'
-import { createHttpTransport } from './backend/transport.ts'
-import { createSshExecutor } from './backend/executor.ts'
-import { Task2DockerRunner } from './backend/runner.ts'
-import { Task2DockerError, type DispatchInput } from './backend/types.ts'
+import { createSshClient } from './backend/ssh.ts'
+import { Store } from './backend/registry.ts'
+import { Task2DockerEngine } from './backend/engine.ts'
+import { Task2DockerError, type Runner } from './backend/types.ts'
+import type { RunnerInput } from './backend/registry.ts'
 
 export const name = 'task2docker'
 export const inject = ['skills', 'tools']
 
-/** Plugin version reported in the client user-agent header. */
-const VERSION = '0.1.0'
+/** One preloaded runner supplied through cordis.yml; empty optional fields mean "use the default". */
+export interface PreloadRunner {
+  name: string
+  host: string
+  port: number
+  user: string
+  auth: string
+  passwordEnv: string
+  passwordFile: string
+  defaultImage: string
+  labels: string[]
+}
 
 /** Deployment configuration for the plugin. */
 export interface Config {
-  /** GraphQL endpoint; empty means read T2D_ENDPOINT / OPENBAYES_GRAPHQL_ENDPOINT. */
-  endpoint: string
-  /** Access token; empty means read T2D_TOKEN / OPENBAYES_TOKEN. Never logged. */
-  token: string
-  /** Compute tier used when a dispatch omits resource. */
-  defaultResource: string
-  /** Container image used when a dispatch omits runtime. */
-  defaultRuntime: string
-  /** When true, dispatch requires an explicit confirm argument, gating the spend behind user agreement. */
-  confirmDispatch: boolean
-  /** Timeout in seconds for a single ssh exec command. */
+  /** Directory holding runners.json and jobs.json; empty means ~/.dsh-task2docker. */
+  stateDir: string
+  /** Per-command SSH timeout in seconds. */
   sshTimeoutSec: number
+  /** Runners registered on load, so a profile ships ready-to-use servers without a manual step. */
+  runners: PreloadRunner[]
 }
 
 export const Config: z<Config> = z.object({
-  endpoint: z.string().default(''),
-  token: z.string().default(''),
-  defaultResource: z.string().default(''),
-  defaultRuntime: z.string().default(''),
-  confirmDispatch: z.boolean().default(true),
-  sshTimeoutSec: z.number().default(30),
+  stateDir: z.string().default(''),
+  sshTimeoutSec: z.number().default(60),
+  runners: z.array(z.object({
+    name: z.string(),
+    host: z.string(),
+    port: z.number().default(22),
+    user: z.string().default('root'),
+    auth: z.string().default('key'),
+    passwordEnv: z.string().default(''),
+    passwordFile: z.string().default(''),
+    defaultImage: z.string().default(''),
+    labels: z.array(z.string()).default([]),
+  })).default([]),
 })
 
-/** Build a fresh, stateless runner for one call; reads credentials at call time so boot never needs them. */
-function buildRunner(config: Config): Task2DockerRunner {
-  const endpoint = config.endpoint || process.env['T2D_ENDPOINT'] || process.env['OPENBAYES_GRAPHQL_ENDPOINT'] || ''
-  const token = config.token || process.env['T2D_TOKEN'] || process.env['OPENBAYES_TOKEN'] || ''
-  const transport = createHttpTransport({ endpoint, token, userAgent: `dsh-task2docker-studio/${VERSION}` })
-  return new Task2DockerRunner(transport, {
-    defaultResource: config.defaultResource,
-    defaultRuntime: config.defaultRuntime,
-    remote: createSshExecutor(Math.max(1, config.sshTimeoutSec) * 1000),
-  })
+/** Build a fresh engine bound to the configured state directory and SSH timeout. */
+function buildEngine(config: Config): Task2DockerEngine {
+  const stateDir = config.stateDir || join(homedir(), '.dsh-task2docker')
+  const ssh = createSshClient(Math.max(1, config.sshTimeoutSec) * 1000)
+  return new Task2DockerEngine(new Store(stateDir), ssh)
 }
 
-/** Wrap a runner call so typed user errors become ok:false results instead of crashes. */
-async function guarded(run: () => Promise<unknown>): Promise<string> {
+function emptyToUndefined(value: string | undefined): string | undefined {
+  return value && value.length ? value : undefined
+}
+
+/** Wrap an engine call so typed user errors become ok:false results instead of crashes. */
+async function guarded(run: () => Promise<unknown> | unknown): Promise<string> {
   try {
     return JSON.stringify({ ok: true, result: await run() })
   } catch (error) {
@@ -78,9 +91,9 @@ const jsonRender = (_args: unknown, value: string) => [
 const STRING_PARAM = { type: 'string' } as const
 
 /**
- * Register the dispatch methodology skill and the six task-to-container tools.
+ * Register the methodology skill, the seven task-to-runner tools, and any preloaded runners.
  * @param ctx - registrant context carrying the skill and tool registries.
- * @param config - deployment endpoint, credential, default and confirmation settings.
+ * @param config - state directory, SSH timeout and preloaded runners.
  * @returns when the plugin is ready.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
@@ -93,176 +106,136 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     invocation: { modelInvocable: true, userInvocable: true },
   }))
 
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 't2d_whoami',
-    description:
-      'Read the remote compute account once per session before dispatching: username, roles, balance, debt, '
-      + 'quota minutes and how many jobs are already running. A locked account or debt must be reported to the '
-      + 'user before any task is dispatched. Read-only and safe.',
-    parameters: {},
-    output: { schema: { type: 'string' }, render: jsonRender },
-    execute: () => guarded(() => buildRunner(config).whoami()),
-    presentCall: () => ({ card: 'generic', title: 'Check remote compute account', kind: 'fetch', rawInput: {} }),
-  })))
+  // Seed preloaded runners on load so a profile is usable without a manual register step.
+  const engine = buildEngine(config)
+  for (const r of config.runners) {
+    const input: RunnerInput = {
+      name: r.name,
+      host: r.host,
+      port: r.port,
+      user: r.user,
+      auth: (r.auth === 'sshpass' ? 'sshpass' : 'key'),
+      passwordEnv: emptyToUndefined(r.passwordEnv),
+      passwordFile: emptyToUndefined(r.passwordFile),
+      defaultImage: emptyToUndefined(r.defaultImage),
+      labels: r.labels,
+    }
+    engine.registerRunner(input)
+  }
 
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 't2d_catalog',
+    name: 't2d_register_runner',
     description:
-      'List the container images (runtimes) and compute tiers (resources) the cluster can currently boot. '
-      + 'Every dispatch needs a runtime id and a resource name taken from here, never from a spoken name. '
-      + 'Resources carry affordable and isFullLoad gates; a tier failing either is not runnable now. Pass device '
-      + 'CPU or GPU to narrow the image list. Read-only.',
+      'Register a compute runner the user controls: any machine reachable over SSH (a cloud server, a GPU box, '
+      + 'a cluster head). Runs are then dispatched to it. auth is "key" (agent/public-key, stores no secret, the '
+      + 'normal path) or "sshpass" (password), and for sshpass you supply a pointer only — passwordEnv names an '
+      + 'environment variable or passwordFile names a 0600 file; the secret is never stored or returned. Set '
+      + 'defaultImage so later runs containerize for isolation.',
     parameters: {
-      device: { ...STRING_PARAM, description: 'Narrow runtimes to a device class: "CPU" or "GPU"; omit for all.' },
-    },
-    output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => buildRunner(config).catalog(args.device)),
-    presentCall: args => ({
-      card: 'generic',
-      title: `List container images and compute tiers${args.device ? ` (${args.device})` : ''}`,
-      kind: 'fetch',
-      rawInput: { device: args.device ?? 'all' },
-    }),
-  })))
-
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 't2d_dispatch',
-    description:
-      'Send a task to an external container: create a Job and start it running remotely so this host does no compute. '
-      + 'mode TASK runs a one-shot command and exits (pass command); mode WORKSPACE boots an interactive container you '
-      + 'then drive with t2d_exec. runtime and resource come from t2d_catalog. Put secrets in parameters with isSecret '
-      + 'true, never inside command. This spends compute: when confirmation is enabled you must pass confirm:true only '
-      + 'after the user approves the restated plan.',
-    parameters: {
-      runtime: { ...STRING_PARAM, required: true, description: 'Container image id from t2d_catalog, e.g. "pytorch-2.11-py312-cu124".' },
-      resource: { ...STRING_PARAM, required: true, description: 'Compute tier name from t2d_catalog, e.g. "a100-1".' },
-      command: { ...STRING_PARAM, description: 'TASK mode: the shell command the container runs. Omit for an interactive workspace.' },
-      mode: { type: 'string', enum: ['TASK', 'WORKSPACE'], description: 'TASK (default) one-shot command; WORKSPACE interactive container.' },
-      name: { ...STRING_PARAM, description: 'Human name for the job and its new project.' },
-      projectId: { ...STRING_PARAM, description: 'File the job under an existing project id instead of a new project.' },
-      parameters: {
-        type: 'array',
-        description: 'Environment variables injected into the container; mark secrets with isSecret.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            name: { type: 'string', required: true, description: 'Variable name (must not start with OPENBAYES_).' },
-            value: { type: 'json', required: true, description: 'A JSON string or number; no objects or arrays.' },
-            isSecret: { type: 'boolean', description: 'true keeps the value env-only and redacted on read-back.' },
-          },
-        },
-      },
-      dataBindings: {
-        type: 'array',
-        description: 'Read-only dataset mounts as name=<owner>/<dataset>/<version>, path=/input0../input4.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            name: { type: 'string', required: true, description: 'Data reference, e.g. "<owner>/<dataset>/<version>".' },
-            path: { type: 'string', required: true, description: 'Canonical mount path /input0../input4 (never /output for datasets).' },
-          },
-        },
-      },
-      confirm: { type: 'boolean', description: 'Set true only after the user approves the restated dispatch plan.' },
+      name: { ...STRING_PARAM, required: true, description: 'Stable handle for later calls, e.g. "gpu-box".' },
+      host: { ...STRING_PARAM, required: true, description: 'SSH host or IP of the server.' },
+      port: { type: 'integer', description: 'SSH port; default 22.' },
+      user: { ...STRING_PARAM, description: 'SSH user; default root.' },
+      auth: { type: 'string', enum: ['key', 'sshpass'], description: 'Authentication: "key" (default) or "sshpass".' },
+      passwordEnv: { ...STRING_PARAM, description: 'sshpass only: name of an env var holding the password.' },
+      passwordFile: { ...STRING_PARAM, description: 'sshpass only: path to a 0600 file holding the password.' },
+      defaultImage: { ...STRING_PARAM, description: 'Container image used when a run asks for isolation.' },
+      labels: { type: 'array', description: 'Free-form tags for grouping/selection.', items: { type: 'string' } },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
     execute(args) {
-      if (config.confirmDispatch && !args.confirm) {
-        return Promise.resolve(JSON.stringify({
-          ok: false,
-          error: 'Dispatch starts paid remote compute. Restate owner, mode, runtime, resource, bindings and the billing effect to the user, then re-call with confirm:true once they agree.',
-        }))
-      }
-      const input: DispatchInput = {
-        runtime: args.runtime,
-        resource: args.resource,
-        command: args.command,
-        mode: args.mode as DispatchInput['mode'],
+      const input: RunnerInput = {
         name: args.name,
-        projectId: args.projectId,
-        parameters: args.parameters,
-        dataBindings: args.dataBindings,
+        host: args.host,
+        port: args.port,
+        user: args.user,
+        auth: args.auth as RunnerInput['auth'],
+        passwordEnv: args.passwordEnv,
+        passwordFile: args.passwordFile,
+        defaultImage: args.defaultImage,
+        labels: args.labels,
       }
-      return guarded(() => buildRunner(config).dispatch(input))
+      return guarded(() => engine.registerRunner(input))
     },
+    presentCall: args => ({ card: 'generic', title: `Register runner ${args.name}`, kind: 'execute', rawInput: { name: args.name, host: args.host, auth: args.auth ?? 'key' } }),
+  })))
+
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 't2d_list_runners',
+    description:
+      'List every registered runner: name, host, port, user, auth kind, default image and labels. Shows credential '
+      + 'pointers only (env var name / file path), never the secret itself. Read-only; run it first to see what exists.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: jsonRender },
+    execute: () => guarded((): Runner[] => engine.listRunners()),
+    presentCall: () => ({ card: 'generic', title: 'List registered runners', kind: 'fetch', rawInput: {} }),
+  })))
+
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 't2d_remove_runner',
+    description: 'Forget a registered runner by name. This does not touch anything already running on it.',
+    parameters: {
+      name: { ...STRING_PARAM, required: true, description: 'Runner handle to remove.' },
+    },
+    output: { schema: { type: 'string' }, render: jsonRender },
+    execute: args => guarded(() => ({ removed: engine.removeRunner(args.name) })),
+    presentCall: args => ({ card: 'generic', title: `Remove runner ${args.name}`, kind: 'execute', rawInput: { name: args.name } }),
+  })))
+
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 't2d_run',
+    description:
+      'Dispatch one command to a registered runner and track it as a job. If an image is given (or the runner has a '
+      + 'defaultImage and native is not set) it starts as a detached Docker container for isolation; otherwise it runs '
+      + 'backgrounded directly on the host. Returns a job id for t2d_status / t2d_logs / t2d_stop. Restate what will run '
+      + 'where before a heavy or destructive command.',
+    parameters: {
+      runner: { ...STRING_PARAM, required: true, description: 'Runner name from t2d_list_runners.' },
+      command: { ...STRING_PARAM, required: true, description: 'Shell command to run on the runner.' },
+      image: { ...STRING_PARAM, description: 'Container image for this run; overrides the runner default.' },
+      native: { type: 'boolean', description: 'Force running on the host without a container.' },
+    },
+    output: { schema: { type: 'string' }, render: jsonRender },
+    execute: args => guarded(() => engine.run({ runner: args.runner, command: args.command, image: args.image, native: args.native })),
     presentCall: args => ({
       card: 'generic',
-      title: `Dispatch ${args.mode ?? 'TASK'} to ${args.resource}`,
+      title: `Run on ${args.runner}`,
       kind: 'execute',
-      rawInput: { runtime: args.runtime, resource: args.resource, mode: args.mode ?? 'TASK', hasCommand: Boolean(args.command) },
+      rawInput: { runner: args.runner, command: args.command, image: args.image ?? 'default', native: args.native ?? false },
     }),
   })))
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 't2d_status',
-    description:
-      'Read one dispatched job: status, sub-status, chosen runtime/resource and access links. Poll until RUNNING '
-      + 'before using links; ssh/service links only appear once the container is up. The ssh password is never returned, '
-      + 'only reported as available. Read-only.',
+    description: 'Query a job\'s live state (RUNNING / SUCCEEDED / FAILED / STOPPED / UNKNOWN) and exit code, and refresh the ledger.',
     parameters: {
-      jobId: { ...STRING_PARAM, required: true, description: 'Job id from t2d_dispatch or t2d_jobs.' },
+      jobId: { ...STRING_PARAM, required: true, description: 'Job id from t2d_run.' },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
-    async execute(args) {
-      return guarded(async () => {
-        const ctxJob = await buildRunner(config).status(args.jobId)
-        const { password, ...rest } = ctxJob
-        return { ...rest, hasSshPassword: Boolean(password) }
-      })
-    },
+    execute: args => guarded(() => engine.status(args.jobId)),
     presentCall: args => ({ card: 'generic', title: `Status of job ${args.jobId}`, kind: 'fetch', rawInput: { jobId: args.jobId } }),
   })))
 
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 't2d_jobs',
-    description:
-      'List this account\'s own WORKSPACE and TASK jobs with id, name, mode, status, resource and links. Use it to find a '
-      + 'job id or see what is already running before dispatching more. Internal sandbox jobs are excluded. Read-only.',
+    name: 't2d_logs',
+    description: 'Read the last lines of a job\'s output (container logs or the native log file) to show or diagnose results.',
     parameters: {
-      status: { ...STRING_PARAM, description: 'Filter to one state, e.g. "RUNNING"; omit for all.' },
+      jobId: { ...STRING_PARAM, required: true, description: 'Job id from t2d_run.' },
+      tail: { type: 'integer', description: 'Number of trailing lines to fetch; default 100.' },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => buildRunner(config).listJobs(args.status)),
-    presentCall: args => ({
-      card: 'generic',
-      title: `List jobs${args.status ? ` (${args.status})` : ''}`,
-      kind: 'fetch',
-      rawInput: { status: args.status ?? 'ALL' },
-    }),
-  })))
-
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 't2d_exec',
-    description:
-      'Run one shell command inside a RUNNING container over SSH (the data-plane for an interactive WORKSPACE, or a quick '
-      + 'inspect/fetch). Resolves the ssh link and password internally; the password is consumed, never returned. Requires '
-      + 'sshpass on the host. The job must be RUNNING or this fails with an actionable message.',
-    parameters: {
-      jobId: { ...STRING_PARAM, required: true, description: 'A RUNNING job that exposes an ssh link.' },
-      command: { ...STRING_PARAM, required: true, description: 'Single shell command to run in the container.' },
-    },
-    output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => buildRunner(config).exec(args.jobId, args.command)),
-    presentCall: args => ({
-      card: 'generic',
-      title: `Run in container ${args.jobId}`,
-      kind: 'execute',
-      rawInput: { jobId: args.jobId, command: args.command },
-    }),
+    execute: args => guarded(() => engine.logs(args.jobId, args.tail ?? 100)),
+    presentCall: args => ({ card: 'generic', title: `Logs of job ${args.jobId}`, kind: 'fetch', rawInput: { jobId: args.jobId, tail: args.tail ?? 100 } }),
   })))
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 't2d_stop',
-    description:
-      'Stop / cancel a running job. For a WORKSPACE this is reversible (restartable later); for a TASK it is terminal. '
-      + 'Confirm with the user before stopping anything that may hold active work.',
+    description: 'Stop a running job (remove the container / kill the backgrounded process). Confirm before stopping work that may matter to the user.',
     parameters: {
       jobId: { ...STRING_PARAM, required: true, description: 'Job id to stop.' },
     },
     output: { schema: { type: 'string' }, render: jsonRender },
-    execute: args => guarded(() => buildRunner(config).stop(args.jobId)),
+    execute: args => guarded(() => engine.stop(args.jobId)),
     presentCall: args => ({ card: 'generic', title: `Stop job ${args.jobId}`, kind: 'execute', rawInput: { jobId: args.jobId } }),
   })))
 }

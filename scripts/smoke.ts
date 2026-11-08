@@ -1,167 +1,151 @@
 /**
- * Deterministic offline smoke for the task-to-docker backend. No network, no credentials: a fake
- * GraphQL transport answers each operation with a recorded payload and a fake remote executor stands
- * in for sshpass, so the whole dispatch flow — payload assembly, mode gating, catalog mapping, ssh
- * link parsing, status polling and exec — runs without a live platform.
+ * Deterministic offline smoke for the vendor-neutral task-to-runner backend. No network, no ssh and no
+ * credentials: a controllable fake SshClient answers each composed command, a temp directory backs the
+ * Store, and a counter makes job ids stable — so registration, container vs native planning, status /
+ * logs / stop parsing and secret-pointer resolution all run without touching a real machine.
  */
 import assert from 'node:assert/strict'
-import { normalizeToken, requireField } from '../src/backend/transport.ts'
-import { buildCreateJobVariables, runtimeId } from '../src/backend/operations.ts'
-import { parseSshLink, buildSshPassArgv, buildSshArgv } from '../src/backend/ssh.ts'
-import { Task2DockerRunner } from '../src/backend/runner.ts'
-import { Task2DockerError, type GraphQLTransport } from '../src/backend/types.ts'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  shQuote, composeContainerStart, composeContainerStatus, composeNativeStart,
+  buildSshArgv, buildSshPassArgv,
+} from '../src/backend/ssh.ts'
+import { normalizeRunner, resolvePassword, Store } from '../src/backend/registry.ts'
+import { Task2DockerEngine } from '../src/backend/engine.ts'
+import { Task2DockerError, type ExecResult, type SshClient, type SshTarget } from '../src/backend/types.ts'
 import { SKILL_BODY } from '../src/skill.ts'
 
-// --- token + field guards ---------------------------------------------------
-assert.equal(normalizeToken('abc'), 'Bearer abc')
-assert.equal(normalizeToken('Bearer abc'), 'Bearer abc')
-assert.throws(() => requireField({ createJob: null }, 'createJob'), /did not take effect/)
-assert.equal(requireField({ me: { x: 1 } }, 'me').x, 1)
+// --- shell quoting + command composition ------------------------------------
+assert.equal(shQuote("it's"), `'it'\\''s'`)
+const cstart = composeContainerStart('t2d-abc', 'pytorch:2.4', 'python train.py')
+assert.match(cstart, /^docker run -d --name 't2d-abc' 'pytorch:2\.4' bash -lc 'python train\.py'$/)
+assert.match(composeContainerStatus('t2d-abc'), /docker inspect -f/)
+assert.match(composeNativeStart('sleep 100', '/tmp/t2d-x.log'), /nohup bash -lc 'sleep 100' > '\/tmp\/t2d-x\.log' 2>&1 & echo \$!$/)
 
-// --- runtime id -------------------------------------------------------------
-assert.equal(runtimeId('pytorch', '2.11-py312-cu124'), 'pytorch-2.11-py312-cu124')
+const target: SshTarget = { host: '203.0.113.10', port: 2200, user: 'root', auth: 'key' }
+const keyArgv = buildSshArgv(target, 'ls')
+assert.ok(keyArgv.includes('-p') && keyArgv.includes('2200'))
+assert.ok(keyArgv.includes('root@203.0.113.10'))
+assert.ok(keyArgv.includes('BatchMode=yes'))
+assert.equal(keyArgv[keyArgv.length - 1], 'ls')
+const pwArgv = buildSshPassArgv(target, 'ls', '/tmp/pw')
+assert.deepEqual(pwArgv.slice(0, 3), ['-f', '/tmp/pw', 'ssh'])
 
-// --- create payload assembly ------------------------------------------------
-const task = buildCreateJobVariables('alice', { runtime: 'pytorch-2.11-py312-cu124', resource: 'a100-1', command: 'python train.py' }, { runtime: '', resource: '' })
-assert.equal(task.userId, 'alice')
-assert.equal(task.input.mode, 'TASK')
-assert.deepEqual(task.input.newTask, { command: 'python train.py' })
-assert.equal(task.input.runtime, 'pytorch-2.11-py312-cu124')
-assert.equal(task.input.resource, 'a100-1')
-assert.equal('newWorkspace' in task.input, false)
+// --- runner normalization + password pointer resolution ---------------------
+const norm = normalizeRunner({ name: ' gpu1 ', host: ' 10.0.0.5 ' })
+assert.equal(norm.name, 'gpu1')
+assert.equal(norm.host, '10.0.0.5')
+assert.equal(norm.port, 22)
+assert.equal(norm.user, 'root')
+assert.equal(norm.auth, 'key')
+assert.throws(() => normalizeRunner({ name: '', host: 'x' }), /non-empty name/)
+assert.throws(() => normalizeRunner({ name: 'a', host: 'x', auth: 'sshpass' }), /neither passwordEnv nor passwordFile/)
 
-const bareTask = buildCreateJobVariables('alice', { runtime: 'r', resource: 'c' }, { runtime: '', resource: '' })
-assert.deepEqual(bareTask.input.newTask, {}, 'TASK with no command sends an empty newTask')
+const pwRunner = normalizeRunner({ name: 'a', host: 'x', auth: 'sshpass', passwordEnv: 'MY_PW' })
+assert.equal(resolvePassword(pwRunner, { MY_PW: 'hunter2' }), 'hunter2')
+assert.throws(() => resolvePassword(pwRunner, {}), /empty right now/)
+const pwFilePath = join(tmpdir(), 't2d-smoke-pw.txt')
+writeFileSync(pwFilePath, 'secret\n', { mode: 0o600 })
+const fileRunner = normalizeRunner({ name: 'b', host: 'x', auth: 'sshpass', passwordFile: pwFilePath })
+assert.equal(resolvePassword(fileRunner), 'secret')
+rmSync(pwFilePath, { force: true })
 
-const ws = buildCreateJobVariables('alice', { runtime: 'r', resource: 'c', mode: 'WORKSPACE' }, { runtime: '', resource: '' })
-assert.equal(ws.input.mode, 'WORKSPACE')
-assert.deepEqual(ws.input.newWorkspace, {})
-
-// defaults fill omitted runtime/resource
-const defaulted = buildCreateJobVariables('alice', { runtime: '', resource: '' }, { runtime: 'pytorch-2-x', resource: 'rtx-4090-1' })
-assert.equal(defaulted.input.runtime, 'pytorch-2-x')
-assert.equal(defaulted.input.resource, 'rtx-4090-1')
-
-// mode gating: unsupported modes rejected
-assert.throws(() => buildCreateJobVariables('a', { runtime: 'r', resource: 'c', mode: 'VIRTUAL_MACHINE' as never }, { runtime: '', resource: '' }), /Only TASK and WORKSPACE/)
-assert.throws(() => buildCreateJobVariables('a', { runtime: '', resource: 'c' }, { runtime: '', resource: '' }), /No runtime selected/)
-
-// reserved parameter prefix + secret flag + binding path validation
-const withParams = buildCreateJobVariables('a', {
-  runtime: 'r', resource: 'c',
-  parameters: [{ name: 'LR', value: 0.001 }, { name: 'HF_TOKEN', value: 'secret', isSecret: true }],
-  dataBindings: [{ name: 'a/ds/v1', path: '/input0' }],
-}, { runtime: '', resource: '' })
-const params = withParams.input.parameters as Array<Record<string, unknown>>
-assert.equal(params[0]?.value, 0.001)
-assert.equal(params[1]?.isSecret, true, 'secret flagged')
-const bindings = withParams.input.dataBindings as Array<Record<string, unknown>>
-assert.equal(bindings[0]?.bindingType, 'DATASET')
-assert.equal(bindings[0]?.bindingAuth, 'READ_ONLY')
-assert.throws(() => buildCreateJobVariables('a', { runtime: 'r', resource: 'c', parameters: [{ name: 'OPENBAYES_X', value: 1 }] }, { runtime: '', resource: '' }), /reserved OPENBAYES_/)
-assert.throws(() => buildCreateJobVariables('a', { runtime: 'r', resource: 'c', dataBindings: [{ name: 'a/d/v', path: '/output' }] }, { runtime: '', resource: '' }), /never mount at \/output/)
-assert.throws(() => buildCreateJobVariables('a', { runtime: 'r', resource: 'c', dataBindings: [{ name: 'a/d/v', path: '/data' }] }, { runtime: '', resource: '' }), /canonical/)
-
-// --- ssh link parsing -------------------------------------------------------
-const sshLinks = [{ name: 'ssh', value: 'ssh root@ssh.openbayes.com -p22001' }, { name: 'auxiliary', value: 'https://x' }]
-const target = parseSshLink(sshLinks)
-assert.deepEqual(target, { host: 'ssh.openbayes.com', port: 22001, user: 'root' })
-assert.throws(() => parseSshLink([{ name: 'workspace', value: 'https://x' }]), /no ssh link/)
-assert.throws(() => parseSshLink([{ name: 'ssh', value: 'ssh root@10.1.2.3 -p22' }]), /internal address/)
-assert.throws(() => parseSshLink([{ name: 'ssh', value: 'garbage' }]), /Could not parse/)
-const passArgv = buildSshPassArgv(target, 'nvidia-smi', '/tmp/pw', { strictHostKey: 'accept-new' })
-assert.deepEqual(passArgv.slice(0, 2), ['-f', '/tmp/pw'])
-assert.ok(passArgv.includes('BatchMode=yes'))
-assert.ok(passArgv.includes('root@ssh.openbayes.com'))
-assert.equal(passArgv[passArgv.length - 1], 'nvidia-smi')
-assert.ok(!buildSshArgv(target, 'ls').includes('sshpass'), 'key argv has no sshpass')
-
-// --- fake transport driving the full runner flow ----------------------------
-const whoamiData = { me: { username: 'alice', displayName: 'Alice', roles: ['USER'], locked: false, account: { balance: { amount: '100.00', currency: 'CNY' }, debtMoney: { amount: '0', currency: 'CNY' } }, quota: { storageQuota: { remainMegaBytes: 4096 }, computationQuota: [{ key: 'gpu', value: { availableMinutes: 120 } }] }, jobs: { pageInfo: { total: 2 } } } }
-const runtimesData = { normalClusterRuntimes: [
-  { framework: 'pytorch', version: '2.11-py312-cu124', device: 'GPU', deprecated: false, labels: ['MACHINE_LEARNING'] },
-  { framework: 'ubuntu', version: '24.04-py312', device: 'CPU', deprecated: false, labels: [] },
-] }
-const resourcesData = { normalClusterResources: [
-  { name: 'a100-1', verboseName: 'A100 x1', gpuResource: 'a100', affordable: true, isFullLoad: false, gpu: [{ name: 'a100', count: 1 }] },
-  { name: 'h800-8', verboseName: 'H800 x8', gpuResource: 'h800', affordable: false, isFullLoad: true, gpu: [{ name: 'h800', count: 8 }] },
-] }
-const createdJob = { id: 'job123', name: 'p1', mode: 'TASK', status: 'CREATED', resource: { name: 'a100-1' }, runtime: { framework: 'pytorch', version: '2.11-py312-cu124' }, links: [] }
-const runningJob = { id: 'job123', name: 'p1', mode: 'WORKSPACE', status: 'RUNNING', subStatus: null, startedAt: '2026-11-08T00:00:00Z', endAt: null, canStop: true, resource: { name: 'a100-1' }, runtime: { framework: 'pytorch', version: '2.11' }, links: sshLinks, password: 'supersecret' }
-const jobList = { party: { jobs: { data: [ { id: 'job1', name: 'a', mode: 'TASK', status: 'RUNNING', resource: { name: 'a100-1' }, runtime: { framework: 'pytorch', version: '2.11' }, links: [] } ], pageInfo: { total: 1 } } } }
-
-let lastCreateVariables: Record<string, unknown> | undefined
-const transport: GraphQLTransport = {
-  async execute<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-    if (query.includes('query Whoami')) return whoamiData as T
-    if (query.includes('normalClusterRuntimes')) return runtimesData as T
-    if (query.includes('normalClusterResources')) return resourcesData as T
-    if (query.includes('mutation CreateJob')) { lastCreateVariables = variables; return { createJob: createdJob } as T }
-    if (query.includes('query LoadJobContext')) return { job: runningJob } as T
-    if (query.includes('query LoadMyJobs')) return jobList as T
-    if (query.includes('mutation StopJob')) return { stopJob: { id: 'job123', status: 'CANCELLING' } } as T
-    throw new Error(`unexpected query: ${query.slice(0, 40)}`)
-  },
+// --- fake SSH client driving the engine -------------------------------------
+function makeFake() {
+  const calls: Array<{ target: SshTarget; command: string }> = []
+  let next: ExecResult = { ok: true, exitCode: 0, stdout: '', stderr: '' }
+  const ssh: SshClient = {
+    async run(t, c) { calls.push({ target: t, command: c }); return next },
+  }
+  return { ssh, calls, setNext: (r: Partial<ExecResult>) => { next = { ok: true, exitCode: 0, stdout: '', stderr: '', ...r } } }
 }
 
-let execCapture: { command: string; password: string; host: string; port: number } | undefined
-const runner = new Task2DockerRunner(transport, {
-  defaultResource: 'a100-1',
-  defaultRuntime: 'pytorch-2.11-py312-cu124',
-  remote: async a => { execCapture = { command: a.command, password: a.password, host: a.host, port: a.port }; return { ok: true, exitCode: 0, stdout: 'gpu ok\n', stderr: '' } },
-})
+const stateDir = mkdtempSync(join(tmpdir(), 't2d-smoke-'))
+try {
+  const fake = makeFake()
+  let counter = 0
+  const engine = new Task2DockerEngine(new Store(stateDir), fake.ssh, {
+    idFactory: () => String(++counter).padStart(3, '0'),
+    now: () => '2026-11-08T00:00:00.000Z',
+  })
 
-const who = await runner.whoami()
-assert.equal(who.username, 'alice')
-assert.equal(who.activeJobs, 2)
-assert.equal(who.availableMinutes, 120)
-assert.equal(who.balance, '100.00 CNY')
+  engine.registerRunner({ name: 'gpu1', host: '10.0.0.5', defaultImage: 'pytorch:2.4' })
+  engine.registerRunner({ name: 'plain', host: '10.0.0.6' })
+  assert.deepEqual(engine.listRunners().map(r => r.name).sort(), ['gpu1', 'plain'])
 
-const cat = await runner.catalog()
-assert.equal(cat.runtimes[0]?.id, 'pytorch-2.11-py312-cu124')
-assert.equal(cat.resources[0]?.affordable, true)
-assert.equal(cat.resources[1]?.isFullLoad, true)
-assert.equal(cat.resources[1]?.gpuSummary, '8x h800')
-const cpuOnly = await runner.catalog('CPU')
-assert.equal(cpuOnly.runtimes.length, 1, 'device filter keeps only CPU images')
+  // container run: image present -> docker run, handle is the deterministic container name
+  fake.setNext({ ok: true, exitCode: 0, stdout: 'containerid123\n', stderr: '' })
+  const job = await engine.run({ runner: 'gpu1', command: 'python train.py' })
+  assert.equal(job.mode, 'container')
+  assert.equal(job.state, 'RUNNING')
+  assert.ok(job.handle.kind === 'container' && job.handle.container === 't2d-001')
+  assert.match(fake.calls.at(-1)!.command, /^docker run -d --name 't2d-001' 'pytorch:2\.4'/)
 
-const dispatch = await runner.dispatch({ runtime: 'pytorch-2.11-py312-cu124', resource: 'a100-1', command: 'python train.py' })
-assert.equal(dispatch.jobId, 'job123')
-assert.equal(dispatch.status, 'CREATED')
-assert.equal((lastCreateVariables?.input as Record<string, unknown>).mode, 'TASK')
+  // native run: no image -> nohup backgrounded, pid parsed from stdout
+  fake.setNext({ ok: true, exitCode: 0, stdout: '  4242\n', stderr: '' })
+  const native = await engine.run({ runner: 'plain', command: 'sleep 100' })
+  assert.equal(native.mode, 'native')
+  assert.ok(native.handle.kind === 'native' && native.handle.pid === '4242')
 
-const status = await runner.status('job123')
-assert.equal(status.status, 'RUNNING')
-assert.equal(status.password, 'supersecret', 'runner keeps the secret for the exec path; the tool layer redacts it')
+  // status parsing
+  fake.setNext({ stdout: 'running|-1' })
+  assert.equal((await engine.status('001')).state, 'RUNNING')
+  fake.setNext({ stdout: 'exited|0' })
+  assert.equal((await engine.status('001')).state, 'SUCCEEDED')
+  assert.equal((await engine.status('001')).exitCode, 0)
+  fake.setNext({ stdout: 'exited|1' })
+  assert.equal((await engine.status('001')).state, 'FAILED')
+  fake.setNext({ stdout: 'MISSING|-1' })
+  assert.equal((await engine.status('001')).state, 'UNKNOWN')
+  fake.setNext({ stdout: 'RUNNING|-1' })
+  assert.equal((await engine.status('002')).state, 'RUNNING', 'native running')
+  fake.setNext({ stdout: 'DONE' })
+  assert.equal((await engine.status('002')).state, 'SUCCEEDED', 'native done')
 
-const jobs = await runner.listJobs()
-assert.equal(jobs[0]?.id, 'job1')
+  // logs + stop
+  fake.setNext({ stdout: 'epoch 3 loss 0.1\n' })
+  assert.equal((await engine.logs('001', 50)).output, 'epoch 3 loss 0.1\n')
+  assert.match(fake.calls.at(-1)!.command, /docker logs --tail 50 't2d-001'/)
+  fake.setNext({ stdout: 'STOPPED\n' })
+  assert.equal((await engine.stop('001')).state, 'STOPPED')
 
-const execRes = await runner.exec('job123', 'nvidia-smi')
-assert.equal(execRes.stdout, 'gpu ok\n')
-assert.equal(execCapture?.host, 'ssh.openbayes.com')
-assert.equal(execCapture?.port, 22001)
-assert.equal(execCapture?.command, 'nvidia-smi')
+  // ledger persists across a fresh Store on the same directory
+  const reopened = new Task2DockerEngine(new Store(stateDir), fake.ssh, { idFactory: () => 'zzz', now: () => 'x' })
+  assert.equal(reopened.listRunners().map(r => r.name).sort().join(','), 'gpu1,plain')
+  assert.ok(reopened.listRunners().find(r => r.name === 'gpu1')?.defaultImage)
 
-const stopped = await runner.stop('job123')
-assert.equal(stopped.status, 'CANCELLING')
+  // failures surface as actionable errors, not crashes
+  await assert.rejects(() => engine.run({ runner: 'missing', command: 'x' }), /No runner named "missing"/)
+  await assert.rejects(() => engine.run({ runner: 'gpu1', command: '   ' }), /non-empty command/)
 
-// exec without a configured remote fails cleanly
-const noExec = new Task2DockerRunner(transport, { defaultResource: '', defaultRuntime: '' })
-await assert.rejects(() => noExec.exec('job123', 'ls'), /not available in this deployment/)
+  // a failing start does not create a job
+  fake.setNext({ ok: false, exitCode: 125, stderr: 'docker: command not found\n' })
+  await assert.rejects(() => engine.run({ runner: 'gpu1', command: 'echo hi' }), /command not found/)
 
-// a locked/no-username account fails at bootstrap
-const anonTransport: GraphQLTransport = { async execute<T>() { return { me: { displayName: 'svc' } } as T } }
-await assert.rejects(() => new Task2DockerRunner(anonTransport, { defaultResource: '', defaultRuntime: '' }).whoami(), /no username/)
+  // password pointer is resolved into the target at call time, never stored
+  const secretRunner = normalizeRunner({ name: 'sec', host: '10.0.0.9', auth: 'sshpass', passwordEnv: 'SEC_PW' })
+  new Store(stateDir).putRunner(secretRunner)
+  const withSecret = new Task2DockerEngine(new Store(stateDir), fake.ssh, { idFactory: () => 's1', now: () => 'x' })
+  process.env['SEC_PW'] = 'topsecret'
+  fake.setNext({ ok: true, stdout: '999', stderr: '' })
+  await withSecret.run({ runner: 'sec', command: 'whoami', native: true })
+  assert.equal(fake.calls.at(-1)!.target.password, 'topsecret')
+  assert.equal(fake.calls.at(-1)!.target.auth, 'sshpass')
+  delete process.env['SEC_PW']
+  await assert.rejects(() => withSecret.run({ runner: 'sec', command: 'whoami', native: true }), /SEC_PW, which is empty/)
 
-// --- skill boot safety ------------------------------------------------------
-assert.ok(!SKILL_BODY.includes('`'), 'SKILL_BODY must not contain raw backticks')
-for (const tool of ['t2d_whoami', 't2d_catalog', 't2d_dispatch', 't2d_status', 't2d_exec', 't2d_stop']) {
-  assert.ok(SKILL_BODY.includes(tool), `skill body walks through ${tool}`)
+  // --- skill boot safety -----------------------------------------------------
+  assert.ok(!SKILL_BODY.includes('`'), 'SKILL_BODY must not contain raw backticks')
+  for (const tool of ['t2d_register_runner', 't2d_list_runners', 't2d_run', 't2d_status', 't2d_logs', 't2d_stop', 't2d_remove_runner']) {
+    assert.ok(SKILL_BODY.includes(tool), `skill body walks through ${tool}`)
+  }
+  assert.ok(SKILL_BODY.includes('native') && SKILL_BODY.includes('container'), 'skill covers container vs native')
+  assert.ok(!SKILL_BODY.includes('OpenBayes') && !SKILL_BODY.includes('HyperAI'), 'skill is vendor-neutral')
+} finally {
+  rmSync(stateDir, { recursive: true, force: true })
 }
-assert.ok(SKILL_BODY.includes('/output') && SKILL_BODY.includes('/input'), 'skill covers container paths')
 
-// --- typed error surface ----------------------------------------------------
 assert.ok(new Task2DockerError('x').actionable)
-
-console.log('smoke: all task2docker assertions passed')
+console.log('smoke: all task2docker (generic runner) assertions passed')

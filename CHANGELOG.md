@@ -2,6 +2,26 @@
 
 All notable changes to this project follow the plugin's own versioning.
 
+## 0.2.0
+
+De-vendored: the tool no longer targets OpenBayes / HyperAI. A runner is now any SSH-reachable machine
+the user controls, with optional Docker for isolation. Also ships as a standalone general Agent Skill.
+
+- **Removed** the OpenBayes GraphQL control plane (`transport.ts`, `operations.ts`, the GraphQL-shaped
+  `runner.ts`/`executor.ts`). No vendor SDK remains in the backend.
+- **New generic engine**: `src/backend/{types,ssh,registry,engine}.ts`. Register runners, dispatch a
+  command as a detached Docker container or backgrounded natively over SSH, then poll status, tail logs
+  and stop. Runner + job ledger persist as JSON under `stateDir` (default `~/.dsh-task2docker`).
+- **New tool set** replaces the vendor tools: `t2d_register_runner`, `t2d_list_runners`,
+  `t2d_remove_runner`, `t2d_run`, `t2d_status`, `t2d_logs`, `t2d_stop`.
+- **Credential pointers, not secrets**: password auth records only `passwordEnv` / `passwordFile`,
+  resolved at call time and never stored or returned; key/agent auth stores nothing secret.
+- **Config** now `stateDir`, `sshTimeoutSec`, and an optional `runners` preload list registered on load.
+- **General Agent Skill**: `skills/dsh-task2docker-studio/` (open format) with a stdlib-only
+  `scripts/t2d.mjs` CLI and a committed `scripts/lib/` runtime derived from the DSH-free backend by
+  `scripts/build-portable.mjs`, so it installs into Claude Code / Cursor / Copilot with no build.
+- Skill body and READMEs rewritten vendor-neutral; offline smoke covers the full runner flow.
+
 ## 0.1.0
 
 Initial release: a DeepSeek Harness plugin that offloads compute from a weak or

@@ -1,6 +1,14 @@
 node_modules/
-lib/
+.pnpm-store/
+/lib/
+*.tsbuildinfo
+.DS_Store
 *.log
+
+# Local credentials only; never commit a real secret.
 .env
 .env.*
 !.env.example
+
+# The portable Agent-Skill runtime under skills/**/scripts/lib IS committed on purpose so
+# `dsh plugin add github:` and a plain folder copy into Claude Code / Cursor work with no build.
