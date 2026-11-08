@@ -1,0 +1,17 @@
+# dsh-task2docker-studio bundle patch.
+# Mounts one plugin that contributes the task-to-container dispatch methodology skill and
+# registers the t2d_whoami / t2d_catalog / t2d_dispatch / t2d_status / t2d_jobs / t2d_exec / t2d_stop
+# tools against an OpenBayes / HyperAI GraphQL endpoint. The endpoint and access token come
+# from this config block or the T2D_ENDPOINT / T2D_TOKEN (or OPENBAYES_TOKEN) environment;
+# tokens are never returned in tool output and never written to the session log.
+
+- insert:
+    - id: task2docker
+      name: 'dsh-task2docker-studio'
+      config:
+        endpoint: ''
+        token: ''
+        defaultResource: ''
+        defaultRuntime: ''
+        confirmDispatch: true
+        sshTimeoutSec: 30

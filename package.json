@@ -1,0 +1,94 @@
+{
+  "name": "dsh-task2docker-studio",
+  "description": "Task-to-Docker studio for DeepSeek Harness: dispatch work from a weak or security-constrained host onto external GPU/container compute. Typed t2d_* tools send a task command to a remote container (OpenBayes / HyperAI Job mode=TASK), poll its status, run one-off commands over SSH, and stop it — the host stays a controller, the container does the compute.",
+  "version": "0.1.0",
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./skill": "./SKILL.md",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "icon.svg",
+    "SKILL.md",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "tsconfig.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "author": "CarryChang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CarryChang/dsh-task2docker-studio.git"
+  },
+  "homepage": "https://github.com/CarryChang/dsh-task2docker-studio#readme",
+  "bugs": {
+    "url": "https://github.com/CarryChang/dsh-task2docker-studio/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "plugin",
+    "docker",
+    "container",
+    "remote-compute",
+    "gpu",
+    "task",
+    "openbayes",
+    "hyperai"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx/esm scripts/smoke.ts",
+    "check": "tsc -p tsconfig.json && node --import tsx/esm scripts/smoke.ts"
+  },
+  "engines": {
+    "dsh": "^0.2.0-rc.1 || ^0.2.1-rc.1 || ^0.2.2-alpha.2",
+    "node": "^22.19.0 || >=24.0.0",
+    "pnpm": ">=11.7.0 <12"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1 || ^4.0.6-alpha.1",
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.1 || ^0.2.1-rc.1 || ^0.2.2-alpha.2",
+    "@deepseek-ai/dsh-skill": "^0.2.0-rc.1 || ^0.2.1-rc.1 || ^0.2.2-alpha.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/dsh-skill": { "optional": true }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/schemastery": "^4.0.0",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-skill": "0.2.1-rc.3",
+    "@types/node": "^22.19.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "packageManager": "pnpm@11.7.0"
+}
